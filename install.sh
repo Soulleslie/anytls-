@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 # AnyTLS for Debian/Ubuntu VPSs with a public IPv4 address.
 # Usage: bash anytls-setup.sh install [domain] [port] [node_name]
-#        bash anytls-setup.sh status|show|password|port [new_port]|version|uninstall|help
+#        bash anytls-setup.sh status|show|password|port [new_port]|version|update|uninstall|help
 set -Eeuo pipefail
 umask 077
 
 DOMAIN=''
 PORT=''
 NODE_NAME=''
-SING_BOX_VERSION='1.14.3'
-# SHA-256 values from https://github.com/SagerNet/sing-box/releases/expanded_assets/v1.14.3
-SHA256_AMD64='eb8a5f1f2643baf1a060d0b5f0d1d015e28b72afa446be2d180f366a5dde18b1'
-SHA256_ARM64='4a7d84daef83bf6473a595f4ca9abb29f034b0fee104f81466c53b14f8c37774'
+RELEASE_API='https://api.github.com/repos/SagerNet/sing-box/releases'
+RELEASE_VERSION=''
+RELEASE_URL=''
+RELEASE_SHA256=''
 CONFIG='/etc/sing-box/config.json'
 MARKER='/etc/sing-box/.anytls-setup-owned'
 ACME_DIR='/var/lib/sing-box/acme'
@@ -37,6 +37,7 @@ ensure_dependencies() {
     command -v openssl >/dev/null 2>&1 || packages+=(openssl)
     command -v ss >/dev/null 2>&1 || packages+=(iproute2)
     command -v runuser >/dev/null 2>&1 || packages+=(util-linux)
+    command -v jq >/dev/null 2>&1 || packages+=(jq)
     if ! dpkg-query -W -f='${Status}' ca-certificates 2>/dev/null | grep -q 'install ok installed'; then
         packages+=(ca-certificates)
     fi
@@ -45,9 +46,82 @@ ensure_dependencies() {
         apt-get update
         apt-get install -y "${packages[@]}"
     fi
-    for command_name in curl dpkg dpkg-query getent ss awk sort od tr systemctl openssl timeout runuser sha256sum; do
+    for command_name in curl dpkg dpkg-deb dpkg-query getent ss awk sort od tr systemctl openssl timeout runuser sha256sum jq; do
         need_command "$command_name"
     done
+}
+
+cleanup_temp() {
+    if [[ -n "$TEMP_DIR" ]]; then rm -rf -- "$TEMP_DIR" || true; fi
+}
+
+fetch_release_metadata() {
+    local selector="$1" arch="$2" api_url release_file tag release_id asset_name
+    local page assets_file asset_json asset_count url digest
+    [[ -n "$TEMP_DIR" && -d "$TEMP_DIR" ]] || fail '临时目录未准备好。'
+    [[ "$arch" == amd64 || "$arch" == arm64 ]] || fail "不支持的架构：$arch"
+    if [[ "$selector" == latest ]]; then
+        api_url="$RELEASE_API/latest"
+    elif [[ "$selector" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        api_url="$RELEASE_API/tags/$selector"
+    else
+        fail "无效的版本：$selector"
+    fi
+
+    release_file="$TEMP_DIR/release.json"
+    curl -fLsS --retry 3 --connect-timeout 10 --max-time 30 \
+        -H 'Accept: application/vnd.github+json' -o "$release_file" "$api_url" \
+        || fail '无法查询 sing-box 官方 GitHub 发布信息。'
+    tag="$(jq -er '.tag_name | select(type == "string")' "$release_file")" \
+        || fail '官方发布信息缺少版本号。'
+    [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "官方版本号格式异常：$tag"
+    if [[ "$selector" != latest && "$tag" != "$selector" ]]; then
+        fail "官方发布版本与请求版本不符：$tag"
+    fi
+    [[ "$(jq -r '[.draft, .prerelease] | join(",")' "$release_file")" == 'false,false' ]] \
+        || fail '查询到的不是正式稳定版。'
+    release_id="$(jq -er '.id | select(type == "number")' "$release_file")" \
+        || fail '官方发布信息缺少 release ID。'
+    RELEASE_VERSION="${tag#v}"
+    asset_name="sing-box_${RELEASE_VERSION}_linux_${arch}.deb"
+    RELEASE_URL=''
+    RELEASE_SHA256=''
+
+    for ((page = 1; page <= 5; page++)); do
+        assets_file="$TEMP_DIR/assets.json"
+        curl -fLsS --retry 3 --connect-timeout 10 --max-time 30 \
+            -H 'Accept: application/vnd.github+json' -o "$assets_file" \
+            "$RELEASE_API/$release_id/assets?per_page=100&page=$page" \
+            || fail '无法读取 sing-box 官方发布文件列表。'
+        asset_count="$(jq -er 'if type == "array" then length else error("invalid assets") end' "$assets_file")" \
+            || fail '官方发布文件列表格式异常。'
+        asset_json="$(jq -c --arg name "$asset_name" \
+            '[.[] | select(.name == $name)] | if length == 1 then .[0] else null end' "$assets_file")" \
+            || fail '无法读取安装包信息。'
+        if [[ "$asset_json" != null ]]; then
+            url="$(jq -er '.browser_download_url | select(type == "string")' <<< "$asset_json")" \
+                || fail '官方安装包缺少下载地址。'
+            digest="$(jq -er '.digest | select(type == "string")' <<< "$asset_json")" \
+                || fail '官方安装包缺少 SHA-256。'
+            [[ "$url" == "https://github.com/SagerNet/sing-box/releases/download/$tag/$asset_name" ]] \
+                || fail '官方安装包下载地址格式异常。'
+            [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || fail '官方安装包 SHA-256 格式异常。'
+            RELEASE_URL="$url"
+            RELEASE_SHA256="${digest#sha256:}"
+            return 0
+        fi
+        (( asset_count == 100 )) || break
+    done
+    fail "官方稳定版 $tag 没有找到 ${asset_name}。"
+}
+
+download_verified_package() {
+    local target="$1"
+    [[ -n "$RELEASE_URL" && -n "$RELEASE_SHA256" ]] || fail '安装包信息尚未准备好。'
+    curl -fL --retry 3 --connect-timeout 10 --max-time 180 -o "$target" "$RELEASE_URL" \
+        || fail '下载安装包失败。'
+    printf '%s  %s\n' "$RELEASE_SHA256" "$target" | sha256sum --check --status \
+        || fail '安装包 SHA-256 与官方发布信息不一致，已停止。'
 }
 
 save_manager() {
@@ -91,7 +165,8 @@ AnyTLS 管理命令（在 VPS 上以 root 身份运行）：
   bash /root/anytls-setup.sh show       # 查看 Surge 节点行（含密码）
   bash /root/anytls-setup.sh password   # 生成新密码；需更新 Surge 节点行
   bash /root/anytls-setup.sh port       # 修改节点端口；需先放行新端口并更新 Surge
-  bash /root/anytls-setup.sh version    # 查看已安装版本及脚本指定版本
+  bash /root/anytls-setup.sh version    # 查看已安装版本及官方最新稳定版
+  bash /root/anytls-setup.sh update     # 手动升级已安装节点的 sing-box
   bash /root/anytls-uninstall.sh        # 卸载本脚本安装的节点
   bash /root/anytls-setup.sh help       # 再次显示本帮助
 EOF
@@ -114,7 +189,8 @@ interactive_menu() {
         say '  3) 修改密码'
         say '  4) 修改端口'
         say '  5) 查看版本'
-        say '  6) 卸载节点'
+        say '  6) 升级 sing-box'
+        say '  7) 卸载节点'
         say '  0) 退出'
         while true; do
             read -r -p '请输入序号并按回车：' choice || return 0
@@ -134,12 +210,13 @@ interactive_menu() {
                     change_port
                     return ;;
                 5) version_node; return ;;
-                6)
+                6) update_node; return ;;
+                7)
                     read -r -p '输入“卸载”二字确认：' confirm || return 0
                     if [[ "$confirm" == '卸载' ]]; then uninstall_node; else say '已取消卸载。'; fi
                     return ;;
                 0) return 0 ;;
-                *) say '请输入 0–6 中的一个数字。' ;;
+                *) say '请输入 0–7 中的一个数字。' ;;
             esac
         done
     else
@@ -238,7 +315,7 @@ install_node() {
         || fail '节点名称不能包含逗号、等号或换行。'
     say
     say "准备安装：$DOMAIN:$PORT"
-    say "请先在服务商安全组放行 TCP 80 和 $PORT；现有 SSH 端口请保持开放。"
+    say "请先在服务商安全组放行 TCP 80 和 ${PORT}；现有 SSH 端口请保持开放。"
     say '[1/4] 检查系统和安装环境…'
     [[ -r /etc/os-release ]] || fail '无法识别系统。'
     # shellcheck source=/dev/null
@@ -246,11 +323,10 @@ install_node() {
     [[ "${ID:-}" == 'ubuntu' || "${ID:-}" == 'debian' ]] || fail '这个脚本仅支持 Debian 和 Ubuntu。'
     need_command dpkg
     need_command dpkg-query
-    local arch expected_sha256
+    local arch
     arch="$(dpkg --print-architecture)"
     case "$arch" in
-        arm64) expected_sha256="$SHA256_ARM64" ;;
-        amd64) expected_sha256="$SHA256_AMD64" ;;
+        arm64|amd64) ;;
         *) fail "不支持的架构：$arch" ;;
     esac
 
@@ -267,29 +343,28 @@ install_node() {
     say '[2/4] 检查域名解析和本机端口…'
     local dns_ips public_ip
     dns_ips="$(getent ahostsv4 "$DOMAIN" | awk '$2 == "STREAM" {print $1}' | sort -u)" \
-        || fail "无法解析域名 $DOMAIN。"
+        || fail "无法解析域名 ${DOMAIN}。"
     [[ -n "$dns_ips" ]] || fail "域名 $DOMAIN 没有 IPv4 A 记录。"
     public_ip="$(curl -4fsS --connect-timeout 5 --max-time 12 https://api.ipify.org)" \
         || fail '无法查到此 VPS 的公网 IPv4。'
     [[ "$dns_ips" == "$public_ip" ]] \
-        || fail "域名 $DOMAIN 解析到 ${dns_ips//$'\n'/, }，但这台 VPS 的公网 IPv4 是 $public_ip。请修正 A 记录，生效后重试。"
+        || fail "域名 $DOMAIN 解析到 ${dns_ips//$'\n'/, }，但这台 VPS 的公网 IPv4 是 ${public_ip}。请修正 A 记录，生效后重试。"
     say "域名已指向这台 VPS：$public_ip"
 
     local listeners
     for check_port in 80 "$PORT"; do
-        listeners="$(ss -H -ltn "sport = :$check_port")" || fail "无法检查本机 TCP $check_port。"
+        listeners="$(ss -H -ltn "sport = :$check_port")" || fail "无法检查本机 TCP ${check_port}。"
         [[ -z "$listeners" ]] || fail "本机 TCP $check_port 已被占用。"
     done
 
-    local package_url password
+    local password
     trap finish_install EXIT
     save_manager
     TEMP_DIR="$(mktemp -d)"
-    package_url="https://github.com/SagerNet/sing-box/releases/download/v${SING_BOX_VERSION}/sing-box_${SING_BOX_VERSION}_linux_${arch}.deb"
-    say "[3/4] 下载并校验 sing-box $SING_BOX_VERSION ($arch)…"
-    curl -fL --retry 3 --connect-timeout 10 --max-time 180 -o "$TEMP_DIR/sing-box.deb" "$package_url"
-    printf '%s  %s\n' "$expected_sha256" "$TEMP_DIR/sing-box.deb" | sha256sum --check --status \
-        || fail 'sing-box 安装包 SHA-256 与官方发布值不一致，已停止。'
+    say '[3/4] 查询官方最新稳定版…'
+    fetch_release_metadata latest "$arch"
+    say "下载并校验 sing-box $RELEASE_VERSION ($arch)…"
+    download_verified_package "$TEMP_DIR/sing-box.deb"
     say '安装包 SHA-256 校验通过。'
     INSTALL_STARTED=1
     dpkg -i "$TEMP_DIR/sing-box.deb"
@@ -353,8 +428,8 @@ EOF
             say '完成：服务已运行，证书链和域名验证通过。'
             say 'Surge 节点（复制下一行到配置文件的 [Proxy] 段）：'
             cat -- "$SURGE_FILE"
-            say "节点行已保存到 $SURGE_FILE；以后运行 bash /root/anytls-setup.sh show 可重新输出。"
-            say "请在云安全组放行 TCP $PORT，并保持 TCP 80 开放以供证书续签。"
+            say "节点行已保存到 ${SURGE_FILE}；以后运行 bash /root/anytls-setup.sh show 可重新输出。"
+            say "请在云安全组放行 TCP ${PORT}，并保持 TCP 80 开放以供证书续签。"
             say
             print_help
             return 0
@@ -405,14 +480,95 @@ status_node() {
 }
 
 version_node() {
-    local installed
+    local installed arch
     installed=''
     if [[ "$(dpkg-query -W -f='${Status}' sing-box 2>/dev/null || true)" == 'install ok installed' ]]; then
         installed="$(dpkg-query -W -f='${Version}' sing-box 2>/dev/null || true)"
     fi
-    say "脚本指定版本：$SING_BOX_VERSION"
     say "已安装版本：${installed:-未安装}"
-    say '更新脚本版本时须同步核对官方安装包的 SHA-256；请勿只修改版本号。'
+    if ! command -v curl >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
+        say '无法检查官方版本：缺少 curl 或 jq；安装节点或运行 update 时会自动补齐。'
+        return 0
+    fi
+    arch="$(dpkg --print-architecture)"
+    TEMP_DIR="$(mktemp -d)"
+    trap cleanup_temp EXIT
+    fetch_release_metadata latest "$arch"
+    say "官方最新稳定版：$RELEASE_VERSION"
+    if [[ -n "$installed" ]]; then
+        if dpkg --compare-versions "$RELEASE_VERSION" gt "$installed"; then
+            say '有新版本。运行 bash /root/anytls-setup.sh update 手动升级。'
+        else
+            say '当前已是最新稳定版，或已安装版本更新。'
+        fi
+    fi
+}
+
+update_node() {
+    need_root
+    load_metadata
+    local installed arch new_version old_version attempt verified=0 restored=1 recovery_dir
+    installed="$(dpkg-query -W -f='${Version}' sing-box 2>/dev/null)" \
+        || fail '无法读取已安装的 sing-box 版本。'
+    [[ "$installed" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+        || fail "已安装版本格式不受支持：${installed}。请先检查软件包来源。"
+    systemctl is-active --quiet sing-box && tls_ok \
+        || fail '升级前服务或 TLS 验证未通过。请先运行 status 排查。'
+    arch="$(dpkg --print-architecture)"
+    ensure_dependencies
+    TEMP_DIR="$(mktemp -d)"
+    trap cleanup_temp EXIT
+
+    say '查询官方最新稳定版…'
+    fetch_release_metadata latest "$arch"
+    new_version="$RELEASE_VERSION"
+    if ! dpkg --compare-versions "$new_version" gt "$installed"; then
+        say "当前版本 ${installed}；官方最新稳定版 ${new_version}。无需升级。"
+        return 0
+    fi
+    say "准备从 sing-box $installed 升级到 ${new_version}。"
+    download_verified_package "$TEMP_DIR/new.deb"
+    say '下载并校验当前版本安装包，供升级失败时恢复…'
+    fetch_release_metadata "v$installed" "$arch"
+    old_version="$RELEASE_VERSION"
+    [[ "$old_version" == "$installed" ]] || fail '旧版本发布信息不一致，已停止。'
+    download_verified_package "$TEMP_DIR/old.deb"
+    cp -a -- "$CONFIG" "$TEMP_DIR/config.backup" \
+        || fail '配置备份失败，已停止升级。'
+    dpkg-deb -x "$TEMP_DIR/new.deb" "$TEMP_DIR/unpacked" \
+        || fail '无法检查新版本安装包，已停止升级。'
+    [[ -x "$TEMP_DIR/unpacked/usr/bin/sing-box" ]] \
+        || fail '新版本安装包中未找到 sing-box 程序，已停止升级。'
+    "$TEMP_DIR/unpacked/usr/bin/sing-box" check -c "$CONFIG" \
+        || fail '新版本不接受当前配置，已停止升级，节点保持原样。'
+
+    if dpkg -i "$TEMP_DIR/new.deb" && systemctl daemon-reload \
+        && runuser -u sing-box -- /usr/bin/sing-box check -c "$CONFIG" \
+        && systemctl restart sing-box; then
+        for ((attempt = 1; attempt <= 5; attempt++)); do
+            if systemctl is-active --quiet sing-box && tls_ok; then
+                verified=1
+                break
+            fi
+            sleep 2
+        done
+    fi
+    if (( verified )); then
+        say "升级完成：sing-box ${new_version}。节点域名、端口和密码未变。"
+        return 0
+    fi
+
+    say '升级或验证失败，正在恢复原版本…' >&2
+    cp -a -- "$TEMP_DIR/config.backup" "$CONFIG" || restored=0
+    dpkg -i "$TEMP_DIR/old.deb" || restored=0
+    systemctl daemon-reload || restored=0
+    systemctl restart sing-box || restored=0
+    if (( restored )) && systemctl is-active --quiet sing-box && tls_ok; then
+        fail "升级失败，已恢复 sing-box ${old_version}；请检查 journalctl -u sing-box -n 60 --no-pager。"
+    fi
+    recovery_dir="$TEMP_DIR"
+    TEMP_DIR=''
+    fail "升级失败且未能验证恢复；原版安装包和配置备份保留在 ${recovery_dir}。请检查 systemctl status sing-box。"
 }
 
 change_password() {
@@ -434,14 +590,14 @@ change_password() {
         || ! runuser -u sing-box -- /usr/bin/sing-box check -c "$CONFIG" \
         || ! systemctl restart sing-box \
         || ! systemctl is-active --quiet sing-box; then
-        mv -f -- "$backup" "$CONFIG" || fail "恢复配置失败，原备份保留在 $backup。"
+        mv -f -- "$backup" "$CONFIG" || fail "恢复配置失败，原备份保留在 ${backup}。"
         systemctl restart sing-box || true
         fail '修改或重启失败，已恢复原密码；请检查 systemctl status sing-box。'
     fi
-    rm -f -- "$backup" || say "提醒：旧配置备份清理失败，请检查 $backup。" >&2
+    rm -f -- "$backup" || say "提醒：旧配置备份清理失败，请检查 ${backup}。" >&2
     say '密码已更换。将下面这一行替换到 Surge 配置文件的 [Proxy] 段：'
     show_node
-    say "节点行也已保存到 $SURGE_FILE。请勿把含密码的节点行发到聊天中。"
+    say "节点行也已保存到 ${SURGE_FILE}。请勿把含密码的节点行发到聊天中。"
 }
 
 change_port() {
@@ -452,25 +608,25 @@ change_port() {
     if [[ -z "$raw_port" ]]; then
         [[ -t 0 ]] || fail '非交互运行时，请在命令中指定新端口。'
         while true; do
-            read -r -p "当前端口 $old_port；请输入新的 AnyTLS TCP 端口：" raw_port \
+            read -r -p "当前端口 ${old_port}；请输入新的 AnyTLS TCP 端口：" raw_port \
                 || fail '已取消输入。'
             if [[ "$raw_port" =~ ^[0-9]{1,5}$ ]]; then
                 new_port="$((10#$raw_port))"
                 if (( new_port >= 1 && new_port <= 65535 && new_port != 80 && new_port != old_port )); then break; fi
             fi
-            say "端口无效。请输入 1–65535 的数字，不能是 TCP 80 或当前端口 $old_port。" >&2
+            say "端口无效。请输入 1–65535 的数字，不能是 TCP 80 或当前端口 ${old_port}。" >&2
         done
     fi
     [[ "$raw_port" =~ ^[0-9]{1,5}$ ]] || fail '端口必须是 1–65535 的数字。'
     new_port="$((10#$raw_port))"
     (( new_port >= 1 && new_port <= 65535 )) || fail '端口必须是 1–65535 的数字。'
     (( new_port != 80 )) || fail 'TCP 80 用于证书验证，请另选节点端口。'
-    (( new_port != old_port )) || fail "新端口与当前端口相同：$old_port。"
-    listeners="$(ss -H -ltn "sport = :$new_port")" || fail "无法检查本机 TCP $new_port。"
+    (( new_port != old_port )) || fail "新端口与当前端口相同：${old_port}。"
+    listeners="$(ss -H -ltn "sport = :$new_port")" || fail "无法检查本机 TCP ${new_port}。"
     [[ -z "$listeners" ]] || fail "本机 TCP $new_port 已被占用。"
     match_count="$(grep -Fc -- "\"listen_port\": $old_port," "$CONFIG" || true)"
     [[ "$match_count" == 1 ]] || fail '配置中的当前端口不唯一或不存在，已停止以避免改错。'
-    say "正在切换到 TCP $new_port；请确认已在服务商安全组放行该端口。"
+    say "正在切换到 TCP ${new_port}；请确认已在服务商安全组放行该端口。"
 
     backup_dir="$(mktemp -d /etc/sing-box/.port-backup.XXXXXX)"
     if ! cp -a -- "$CONFIG" "$MARKER" "$backup_dir/"; then
@@ -482,8 +638,8 @@ change_port() {
         || ! chmod 640 "$CONFIG" \
         || ! printf '%s\n%s\n%s\n' "$DOMAIN" "$new_port" "$NODE_NAME" > "$MARKER" \
         || ! chmod 600 "$MARKER"; then
-        cp -a -- "$backup_dir/config.json" "$CONFIG" || fail "恢复配置失败，原备份保留在 $backup_dir。"
-        cp -a -- "$backup_dir/.anytls-setup-owned" "$MARKER" || fail "恢复安装记录失败，原备份保留在 $backup_dir。"
+        cp -a -- "$backup_dir/config.json" "$CONFIG" || fail "恢复配置失败，原备份保留在 ${backup_dir}。"
+        cp -a -- "$backup_dir/.anytls-setup-owned" "$MARKER" || fail "恢复安装记录失败，原备份保留在 ${backup_dir}。"
         rm -rf -- "$backup_dir"
         fail '修改端口文件失败，已恢复旧配置。'
     fi
@@ -499,17 +655,17 @@ change_port() {
         done
     fi
     if (( verified == 0 )); then
-        cp -a -- "$backup_dir/config.json" "$CONFIG" || fail "恢复配置失败，原备份保留在 $backup_dir。"
-        cp -a -- "$backup_dir/.anytls-setup-owned" "$MARKER" || fail "恢复安装记录失败，原备份保留在 $backup_dir。"
+        cp -a -- "$backup_dir/config.json" "$CONFIG" || fail "恢复配置失败，原备份保留在 ${backup_dir}。"
+        cp -a -- "$backup_dir/.anytls-setup-owned" "$MARKER" || fail "恢复安装记录失败，原备份保留在 ${backup_dir}。"
         PORT="$old_port"
         systemctl restart sing-box || say '旧配置已恢复，但服务重启失败；请检查 systemctl status sing-box。' >&2
-        rm -rf -- "$backup_dir" || say "提醒：旧配置备份清理失败，请检查 $backup_dir。" >&2
-        fail "新端口 $new_port 启动或 TLS 验证失败，已恢复旧端口 $old_port；请查看 systemctl status sing-box。"
+        rm -rf -- "$backup_dir" || say "提醒：旧配置备份清理失败，请检查 ${backup_dir}。" >&2
+        fail "新端口 $new_port 启动或 TLS 验证失败，已恢复旧端口 ${old_port}；请查看 systemctl status sing-box。"
     fi
-    rm -rf -- "$backup_dir" || say "提醒：旧配置备份清理失败，请检查 $backup_dir。" >&2
-    say "已从 TCP $old_port 切换到 TCP $new_port。请将下面的新节点行替换到 Surge 的 [Proxy] 段："
+    rm -rf -- "$backup_dir" || say "提醒：旧配置备份清理失败，请检查 ${backup_dir}。" >&2
+    say "已从 TCP $old_port 切换到 TCP ${new_port}。请将下面的新节点行替换到 Surge 的 [Proxy] 段："
     show_node
-    say "确认 Surge 可连接后，再关闭云安全组中的旧端口 $old_port。TCP 80 仍需保持开放。"
+    say "确认 Surge 可连接后，再关闭云安全组中的旧端口 ${old_port}。TCP 80 仍需保持开放。"
     say '请勿把含密码的节点行发到聊天中。'
 }
 
@@ -539,6 +695,7 @@ case "${1:-}" in
     password) change_password ;;
     port) shift; change_port "$@" ;;
     version) version_node ;;
+    update) update_node ;;
     uninstall) uninstall_node ;;
     *) print_help; exit 2 ;;
 esac
