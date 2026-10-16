@@ -177,7 +177,7 @@ interactive_menu() {
         print_help
         return
     fi
-    local choice confirm saved_domain saved_port
+    local choice saved_domain saved_port
     say
     say '========== AnyTLS 节点管理 =========='
     if [[ -f "$MARKER" && -f "$CONFIG" ]]; then
@@ -212,8 +212,7 @@ interactive_menu() {
                 5) version_node; return ;;
                 6) update_node; return ;;
                 7)
-                    read -r -p '输入“卸载”二字确认：' confirm || return 0
-                    if [[ "$confirm" == '卸载' ]]; then uninstall_node; else say '已取消卸载。'; fi
+                    uninstall_node
                     return ;;
                 0) return 0 ;;
                 *) say '请输入 0–7 中的一个数字。' ;;
@@ -669,9 +668,22 @@ change_port() {
     say '请勿把含密码的节点行发到聊天中。'
 }
 
+confirm_uninstall() {
+    local answer
+    while true; do
+        read -r -p '确定卸载节点？[y/N]（直接回车默认 n）：' answer || { say '已取消卸载。'; return 1; }
+        case "$answer" in
+            y|Y) return 0 ;;
+            n|N|'') say '已取消卸载。'; return 1 ;;
+            *) say '请输入 y 或 n。' ;;
+        esac
+    done
+}
+
 uninstall_node() {
     need_root
     [[ -f "$MARKER" ]] || fail '未发现本脚本安装的节点，已停止以保护现有服务。'
+    confirm_uninstall || return 0
     systemctl disable --now sing-box >/dev/null 2>&1 || true
     apt-get purge -y sing-box
     rm -f -- "$CONFIG" "$MARKER" "$SURGE_FILE" /etc/sing-box/config.json.backup.*
