@@ -183,6 +183,7 @@ interactive_menu() {
     if [[ -f "$MARKER" && -f "$CONFIG" ]]; then
         saved_domain="$(sed -n '1p' "$MARKER")"
         saved_port="$(sed -n '2p' "$MARKER")"
+        say '检测到本脚本已配置的节点。'
         say "当前节点：${saved_domain:-未知域名}:${saved_port:-未知端口}"
         say '  1) 查看节点状态'
         say '  2) 查看 Surge 节点行（含密码）'
@@ -274,11 +275,36 @@ show_node() {
     printf '%s\n' "$line"
 }
 
+check_install_eligibility() {
+    local saved_domain saved_port
+    if [[ -f "$MARKER" && -f "$CONFIG" ]]; then
+        saved_domain="$(sed -n '1p' "$MARKER")"
+        saved_port="$(sed -n '2p' "$MARKER")"
+        fail "检测到本脚本已配置节点 ${saved_domain:-未知域名}:${saved_port:-未知端口}。请运行 bash /root/anytls-setup.sh 打开管理菜单。"
+    fi
+    [[ ! -e "$MARKER" && ! -L "$MARKER" ]] || fail '检测到已有节点安装记录，但配置不完整；已停止以保护现有文件。'
+    if command -v dpkg-query >/dev/null 2>&1 \
+        && dpkg-query -W -f='${Status}' sing-box >/dev/null 2>&1; then
+        fail '检测到已有 sing-box 软件包记录。请先检查 dpkg-query -W sing-box；本脚本不会覆盖现有安装。'
+    fi
+    [[ ! -e /etc/sing-box && ! -L /etc/sing-box ]] || fail '/etc/sing-box 已存在，为避免覆盖配置，已停止。'
+    [[ ! -e /root/anytls-uninstall.sh && ! -L /root/anytls-uninstall.sh ]] || fail '/root/anytls-uninstall.sh 已存在，为避免覆盖，已停止。'
+    [[ ! -e "$ACME_DIR" && ! -L "$ACME_DIR" ]] || fail "$ACME_DIR 已存在，为避免覆盖证书数据，已停止。"
+    [[ ! -e "$SURGE_FILE" && ! -L "$SURGE_FILE" ]] || fail "$SURGE_FILE 已存在，为避免覆盖节点信息，已停止。"
+    if command -v sing-box >/dev/null 2>&1; then
+        fail '检测到已有 sing-box 程序；本脚本不会覆盖现有安装。'
+    fi
+    if command -v systemctl >/dev/null 2>&1 && systemctl cat sing-box.service >/dev/null 2>&1; then
+        fail '检测到已有 sing-box 系统服务；本脚本不会覆盖现有安装。'
+    fi
+}
+
 install_node() {
     need_root
     [[ -f "${BASH_SOURCE[0]}" && "${BASH_SOURCE[0]}" != /dev/fd/* && "${BASH_SOURCE[0]}" != /proc/*/fd/* ]] \
         || fail '请先将脚本下载为普通文件再运行；不支持 curl | bash。'
     [[ $# -le 3 ]] || fail '用法：bash anytls-setup.sh install [域名] [端口] [节点名称]'
+    check_install_eligibility
     DOMAIN="${1:-}"
     if [[ -z "$DOMAIN" ]]; then
         [[ -t 0 ]] || fail '非交互运行时，请在命令中指定域名。'
@@ -329,14 +355,7 @@ install_node() {
         *) fail "不支持的架构：$arch" ;;
     esac
 
-    [[ ! -e "$MARKER" ]] || fail '已由本脚本安装；运行 status 或 show 查看。'
-    if dpkg-query -W -f='${Status}' sing-box >/dev/null 2>&1; then
-        fail '检测到已有 sing-box 软件包记录。请先检查 dpkg-query -W sing-box；本脚本不会覆盖现有安装。'
-    fi
-    [[ ! -e /etc/sing-box ]] || fail '/etc/sing-box 已存在，为避免覆盖配置，已停止。'
-    [[ ! -e /root/anytls-uninstall.sh ]] || fail '/root/anytls-uninstall.sh 已存在，为避免覆盖，已停止。'
-    [[ ! -e "$ACME_DIR" ]] || fail "$ACME_DIR 已存在，为避免覆盖证书数据，已停止。"
-    [[ ! -e "$SURGE_FILE" ]] || fail "$SURGE_FILE 已存在，为避免覆盖节点信息，已停止。"
+    check_install_eligibility
     ensure_dependencies
 
     say '[2/4] 检查域名解析和本机端口…'
