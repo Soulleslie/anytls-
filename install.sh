@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # AnyTLS for Debian/Ubuntu VPSs with a public IPv4 address.
 # Usage: bash anytls-setup.sh install [domain] [port] [node_name]
-#        bash anytls-setup.sh status|show|password|port [new_port]|uninstall
+#        bash anytls-setup.sh status|show|password|port [new_port]|uninstall|help
 set -Eeuo pipefail
 umask 077
 
@@ -18,6 +18,19 @@ say() { printf '%s\n' "$*"; }
 fail() { printf '错误：%s\n' "$*" >&2; exit 1; }
 need_root() { [[ $EUID -eq 0 ]] || fail '请以 root 身份运行：bash /root/anytls-setup.sh ...'; }
 need_command() { command -v "$1" >/dev/null 2>&1 || fail "缺少命令：$1"; }
+
+print_help() {
+    cat <<'EOF'
+AnyTLS 管理命令（在 VPS 上以 root 身份运行）：
+  bash /root/anytls-setup.sh install    # 新 VPS 安装；按提示输入域名和端口
+  bash /root/anytls-setup.sh status     # 检查服务和证书
+  bash /root/anytls-setup.sh show       # 查看 Surge 节点行（含密码）
+  bash /root/anytls-setup.sh password   # 生成新密码；需更新 Surge 节点行
+  bash /root/anytls-setup.sh port       # 修改节点端口；需先放行新端口并更新 Surge
+  bash /root/anytls-uninstall.sh        # 卸载本脚本安装的节点
+  bash /root/anytls-setup.sh help       # 再次显示本帮助
+EOF
+}
 
 load_metadata() {
     [[ -f "$MARKER" && -f "$CONFIG" ]] || fail '未发现本脚本安装的节点。'
@@ -178,7 +191,8 @@ EOF
             show_node
             say "节点行已保存到 $SURGE_FILE；以后运行 bash /root/anytls-setup.sh show 可重新输出。"
             say "请在云安全组放行 TCP $PORT，并保持 TCP 80 开放以供证书续签。"
-            say '一键卸载：bash /root/anytls-uninstall.sh'
+            say
+            print_help
             return 0
         fi
         sleep 5
@@ -294,12 +308,12 @@ uninstall_node() {
 }
 
 case "${1:-}" in
+    ''|help|-h|--help) print_help ;;
     install) shift; install_node "$@" ;;
     status) status_node ;;
     show) show_node ;;
     password) change_password ;;
     port) shift; change_port "$@" ;;
     uninstall) uninstall_node ;;
-    *) say '用法：bash /root/anytls-setup.sh install [域名] [端口] [节点名称]';
-       say '      bash /root/anytls-setup.sh status|show|password|port [新端口]|uninstall'; exit 2 ;;
+    *) print_help; exit 2 ;;
 esac
