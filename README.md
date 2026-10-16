@@ -25,7 +25,7 @@ bash /root/anytls-setup.sh
 
 确认每行没有报错，再运行下一行。脚本会打开中文菜单；输入 `1` 安装，再按提示输入域名和端口。也可以直接运行 `bash /root/anytls-setup.sh install`，同样会提示输入域名和端口。
 
-脚本会检查系统、域名解析和本机端口，校验下载包，配置 sing-box，并等待证书签发。域名或端口格式输错时会重新提示。
+脚本会检查系统、域名解析和本机端口，从 sing-box 官方 GitHub 获取**最新稳定版**（不选预发布版），校验安装包 SHA-256，配置 sing-box，并等待证书签发。域名或端口格式输错时会重新提示。
 
 不要使用 `curl | bash`：安装需要从终端读取输入，管理脚本也需要保留在 VPS 上。如果下载时提示 `curl: command not found`，先运行 `apt-get update && apt-get install -y curl ca-certificates`。
 
@@ -49,10 +49,24 @@ AnyTLS-SG = anytls, sg.example.com, 12003, password=你的实际密码, skip-cer
 | `bash /root/anytls-setup.sh show` | 输出 Surge 节点行，**包含密码** |
 | `bash /root/anytls-setup.sh password` | 生成新密码；随后替换 Surge 中的旧节点行 |
 | `bash /root/anytls-setup.sh port` | 修改节点端口；先放行新端口，完成后更新 Surge |
-| `bash /root/anytls-setup.sh version` | 查看已安装版本及脚本指定版本 |
+| `bash /root/anytls-setup.sh version` | 查看已安装版本及官方最新稳定版 |
+| `bash /root/anytls-setup.sh update` | 手动升级 sing-box；升级后检查服务和 TLS |
 | `bash /root/anytls-uninstall.sh` | 卸载本脚本安装的节点 |
 
-证书由 sing-box 的 ACME 配置自动续签。请保持 sing-box 服务运行、域名解析正确，并让 TCP 80 能从外部访问。`status` 在 VPS 本机检查服务与 TLS；还需在 Surge 中测试外部连接。
+**已安装的节点不会自动升级 sing-box。**运行 `update` 时，脚本先下载并校验新版和当前版本的官方安装包，检查新版是否接受现有配置；升级后验证服务与 TLS，失败时尝试恢复旧版。节点域名、端口和密码不随程序升级改变。
+
+如果 VPS 上仍是以前保存的旧管理脚本，请先在该 VPS 上更新脚本，再手动升级：
+
+```bash
+curl -fL -o /root/anytls-setup.new.sh 'https://github.com/Soulleslie/anytls-/raw/refs/heads/main/install.sh'
+test -s /root/anytls-setup.new.sh
+bash -n /root/anytls-setup.new.sh
+install -m 700 /root/anytls-setup.new.sh /root/anytls-setup.sh
+bash /root/anytls-setup.sh version
+bash /root/anytls-setup.sh update
+```
+
+证书由 sing-box 的 ACME 配置自动续签，与程序版本升级是两回事。请保持 sing-box 服务运行、域名解析正确，并让 TCP 80 能从外部访问。`status` 在 VPS 本机检查服务与 TLS；还需在 Surge 中测试外部连接。
 
 ## 卸载范围
 
@@ -65,5 +79,4 @@ AnyTLS-SG = anytls, sg.example.com, 12003, password=你的实际密码, skip-cer
 - **修改密码后旧节点失效**：运行 `show`，将新输出的整行节点配置替换到 Surge。
 - **修改端口后连不上**：确认新端口已放行，运行 `show` 更新 Surge。确认新端口可连接后，再关闭旧端口的安全组规则。
 
-脚本当前指定 sing-box 1.14.3，并校验官方发布包的 SHA-256。更新版本时需要同步核对对应架构安装包的 SHA-256。安装失败时，脚本会尝试撤销本次创建的节点文件和服务；为补齐依赖而安装的基础工具会保留。
-
+脚本从官方 GitHub Release API 读取稳定版和安装包 SHA-256；如果无法取得版本、安装包或校验值，会停止安装或升级。安装失败时，脚本会尝试撤销本次创建的节点文件和服务；为补齐依赖而安装的基础工具会保留。
