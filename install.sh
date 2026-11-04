@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION='2.1.0'
+SCRIPT_VERSION='2.1.1'
 SCRIPT_URL='https://raw.githubusercontent.com/Soulleslie/anytls-/main/install.sh'
 DOMAIN=''
 PORT=''
@@ -27,6 +27,7 @@ TFO_TAG='# anytls-setup: TCP Fast Open'
 TEMP_DIR=''
 TLS_OUTPUT=''
 LATEST_VERSION=''
+REMOTE_SCRIPT_VERSION=''
 MARKER_DOMAIN=''
 MARKER_PORT=''
 MARKER_NAME=''
@@ -1257,18 +1258,40 @@ menu_status() {
     say " 当前节点：${MARKER_NAME:-未命名}（${MARKER_DOMAIN:-未知域名}:${MARKER_PORT:-未知端口}）"
 }
 
+# 只读取 GitHub 上最新脚本的开头部分，取出版本号；失败时输出为空，不影响菜单。
+query_remote_script_version() {
+    local head_text=''
+    if command -v curl >/dev/null 2>&1; then
+        head_text="$(curl -fsS -r 0-2047 --connect-timeout 5 --max-time 8 "$SCRIPT_URL" 2>/dev/null || true)"
+    elif command -v wget >/dev/null 2>&1; then
+        head_text="$(wget -qO- -T 8 -t 1 "$SCRIPT_URL" 2>/dev/null | head -c 2048 || true)"
+    fi
+    sed -n "s/^SCRIPT_VERSION='\([0-9][0-9.]*\)'.*/\1/p" <<< "$head_text" | head -n 1
+}
+# 判断版本号 $1 是否高于 $2。
+version_gt() {
+    [[ -n "$1" && -n "$2" && "$1" != "$2" ]] || return 1
+    if command -v dpkg >/dev/null 2>&1; then
+        dpkg --compare-versions "$1" gt "$2" 2>/dev/null
+    else
+        [[ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n 1)" == "$1" ]]
+    fi
+}
+
 show_menu() {
-    local installed upgrade_tag=''
+    local installed upgrade_tag='' script_tag=''
     installed="$(installed_version)"
-    if [[ -n "$LATEST_VERSION" && -n "$installed" ]] \
-        && dpkg --compare-versions "$LATEST_VERSION" gt "$installed" 2>/dev/null; then
+    if version_gt "$LATEST_VERSION" "$installed"; then
         upgrade_tag="  ${YELLOW}(可升级到 ${LATEST_VERSION})${RESET}"
+    fi
+    if version_gt "$REMOTE_SCRIPT_VERSION" "$SCRIPT_VERSION"; then
+        script_tag="  ${YELLOW}(可更新到 v${REMOTE_SCRIPT_VERSION})${RESET}"
     fi
     if [[ -t 1 ]]; then clear 2>/dev/null || true; fi
     say '=============================='
     say " AnyTLS 节点管理脚本 ${RED}[v${SCRIPT_VERSION}]${RESET}"
     say '=============================='
-    say "  ${GREEN}0.${RESET} 更新脚本"
+    say "  ${GREEN}0.${RESET} 更新脚本${script_tag}"
     say '——————————————————————————————'
     say "  ${GREEN}1.${RESET} 安装节点"
     say "  ${GREEN}2.${RESET} 卸载节点（含清理残留）"
@@ -1323,8 +1346,9 @@ interactive_menu() {
     need_root
     ensure_shortcut quiet || true
     local choice rc before dummy
+    say '正在检查更新…'
+    REMOTE_SCRIPT_VERSION="$(query_remote_script_version)"
     if [[ -f "$MARKER" ]]; then
-        say '正在检查 sing-box 新版本…'
         LATEST_VERSION="$(query_latest_version)"
     fi
     while true; do
