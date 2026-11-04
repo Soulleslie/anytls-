@@ -758,7 +758,7 @@ uninstall_node() {
     rm -rf -- /etc/sing-box/.port-backup.*
     rm -rf -- "$ACME_DIR"
     rmdir -- /etc/sing-box /var/lib/sing-box 2>/dev/null || true
-    rm -f -- /root/anytls-uninstall.sh "$MANAGER"
+    rm -f -- /root/anytls-uninstall.sh "$MANAGER" /root/anytls-setup.new.sh
     say '已移除本脚本安装的 sing-box、配置和证书数据。'
     if [[ -d /etc/sing-box || -d /var/lib/sing-box ]]; then
         say '部分目录还含有其他文件，已保留；可用 ls -la /etc/sing-box /var/lib/sing-box 检查。'

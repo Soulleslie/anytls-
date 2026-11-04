@@ -61,7 +61,7 @@ AnyTLS-SG = anytls, sg.example.com, 12003, password=你的实际密码, skip-cer
 curl -fL -o /root/anytls-setup.new.sh 'https://github.com/Soulleslie/anytls-/raw/refs/heads/main/install.sh'
 test -s /root/anytls-setup.new.sh
 bash -n /root/anytls-setup.new.sh
-install -m 700 /root/anytls-setup.new.sh /root/anytls-setup.sh
+install -m 700 /root/anytls-setup.new.sh /root/anytls-setup.sh && rm -f /root/anytls-setup.new.sh
 bash /root/anytls-setup.sh version
 bash /root/anytls-setup.sh update
 ```
@@ -70,7 +70,7 @@ bash /root/anytls-setup.sh update
 
 ## 卸载范围
 
-卸载命令会停止并移除本脚本安装的 sing-box、节点配置、证书数据、保存的 Surge 节点行和管理脚本。它不会修改域名 DNS 记录、云安全组规则、系统防火墙规则或 Surge 中的配置。无论从中文菜单还是直接运行卸载命令，脚本都会提示 `确定卸载节点？[y/N]`：输入 `y` 并按回车才会卸载；输入 `n` 或直接按回车都会取消。
+卸载命令会停止并移除本脚本安装的 sing-box、节点配置、证书数据、保存的 Surge 节点行和管理脚本（包括更新脚本时下载的 `/root/anytls-setup.new.sh`）。它不会修改域名 DNS 记录、云安全组规则、系统防火墙规则或 Surge 中的配置。无论从中文菜单还是直接运行卸载命令，脚本都会提示 `确定卸载节点？[y/N]`：输入 `y` 并按回车才会卸载；输入 `n` 或直接按回车都会取消。
 
 ## 常见问题
 
