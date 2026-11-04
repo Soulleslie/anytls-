@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# AnyTLS for Debian/Ubuntu VPSs with a public IPv4 address.
-# Usage: bash anytls-setup.sh install [domain] [port] [node_name]
-#        bash anytls-setup.sh status|show|password|port [new_port]|version|update|uninstall|help
+# AnyTLS 节点管理脚本：Debian/Ubuntu + sing-box + Let's Encrypt。
+# 安装：wget -O /root/anytls-setup.sh https://raw.githubusercontent.com/Soulleslie/anytls-/main/install.sh && chmod +x /root/anytls-setup.sh && /root/anytls-setup.sh
+# 用法：anytls [命令]，命令列表见 anytls help。
 set -Eeuo pipefail
 umask 077
 
+SCRIPT_VERSION='2.0.0'
+SCRIPT_URL='https://raw.githubusercontent.com/Soulleslie/anytls-/main/install.sh'
 DOMAIN=''
 PORT=''
 NODE_NAME=''
@@ -17,7 +19,12 @@ MARKER='/etc/sing-box/.anytls-setup-owned'
 ACME_DIR='/var/lib/sing-box/acme'
 SURGE_FILE='/root/anytls-surge.txt'
 MANAGER='/root/anytls-setup.sh'
+UNINSTALLER='/root/anytls-uninstall.sh'
+SHORTCUT='/usr/local/bin/anytls'
+SHORTCUT_TAG='# anytls-setup shortcut'
 TEMP_DIR=''
+TLS_OUTPUT=''
+LATEST_VERSION=''
 MARKER_DOMAIN=''
 MARKER_PORT=''
 MARKER_NAME=''
@@ -25,10 +32,20 @@ INSTALL_STARTED=0
 INSTALL_COMMITTED=0
 MANAGER_COPIED=0
 
+if [[ -t 1 && -z "${NO_COLOR:-}" && "${TERM:-dumb}" != dumb ]]; then
+    GREEN=$'\033[32m' RED=$'\033[31m' YELLOW=$'\033[33m' BOLD=$'\033[1m' RESET=$'\033[0m'
+else
+    GREEN='' RED='' YELLOW='' BOLD='' RESET=''
+fi
+
 say() { printf '%s\n' "$*"; }
-fail() { printf '错误：%s\n' "$*" >&2; exit 1; }
-need_root() { [[ $EUID -eq 0 ]] || fail '请以 root 身份运行：bash /root/anytls-setup.sh ...'; }
+ok() { printf '%s%s%s\n' "$GREEN" "$*" "$RESET"; }
+warn() { printf '%s%s%s\n' "$YELLOW" "$*" "$RESET"; }
+step() { printf '%s%s%s\n' "$BOLD" "$*" "$RESET"; }
+fail() { printf '%s错误：%s%s\n' "$RED" "$*" "$RESET" >&2; exit 1; }
+need_root() { [[ $EUID -eq 0 ]] || fail '请以 root 身份运行（可先执行 sudo -i）。'; }
 need_command() { command -v "$1" >/dev/null 2>&1 || fail "缺少命令：$1"; }
+
 valid_domain() {
     (( ${#1} <= 253 )) || return 1
     [[ "$1" == *.* && "$1" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?[.])+[a-z]([a-z0-9-]{0,61}[a-z0-9])?$ ]]
@@ -37,10 +54,27 @@ valid_domain() {
 valid_port() {
     [[ "$1" =~ ^[0-9]{1,5}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 && 10#$1 != 80 ))
 }
+# 节点名称会写进 Surge 节点行，不能含逗号、等号或换行。
+valid_node_name() {
+    [[ -n "$1" && ${#1} -le 64 && "$1" != *','* && "$1" != *'='* && "$1" != *$'\n'* ]]
+}
 port_free() {
     local listeners
     listeners="$(ss -H -ltn "sport = :$1")" || fail "无法检查本机 TCP ${1}。"
     [[ -z "$listeners" ]]
+}
+# 在 20000–60000 之间随机挑一个本机未占用的端口。
+random_port() {
+    local attempt n p
+    for ((attempt = 0; attempt < 50; attempt++)); do
+        n="$(od -An -N2 -tu2 /dev/urandom | tr -d '[:space:]')"
+        p=$((20000 + n % 40001))
+        if ! command -v ss >/dev/null 2>&1 || port_free "$p"; then
+            printf '%s' "$p"
+            return 0
+        fi
+    done
+    return 1
 }
 gen_password() {
     local pw
@@ -73,6 +107,15 @@ edit_config() {
     rm -f -- "$tmp"
     return 1
 }
+# 本机 TLS 握手并校验证书链与域名；握手输出保存在 TLS_OUTPUT，供读取证书到期时间。
+tls_ok() {
+    TLS_OUTPUT="$(timeout 6 openssl s_client \
+        -connect "127.0.0.1:${PORT}" \
+        -servername "$DOMAIN" \
+        -verify_hostname "$DOMAIN" \
+        -verify_return_error </dev/null 2>&1 || true)"
+    [[ "$TLS_OUTPUT" == *'Verify return code: 0 (ok)'* ]]
+}
 # 等待服务运行且本机 TLS 验证通过；参数为最多尝试次数（每次间隔 2 秒）。
 wait_tls() {
     local attempt
@@ -93,6 +136,29 @@ public_ipv4() {
         fi
     done
     return 1
+}
+# 询问 y/n；第二个参数是直接回车时的默认值（y 或 n，默认 n）。
+confirm() {
+    local answer default="${2:-n}"
+    while true; do
+        read -r -p "$1" answer || return 1
+        [[ -n "$answer" ]] || answer="$default"
+        case "$answer" in
+            y|Y|yes|YES) return 0 ;;
+            n|N|no|NO) return 1 ;;
+            *) warn '请输入 y 或 n。' ;;
+        esac
+    done
+}
+format_duration() {
+    local s="$1"
+    if (( s >= 86400 )); then
+        printf '%d 天 %d 小时' $((s / 86400)) $((s % 86400 / 3600))
+    elif (( s >= 3600 )); then
+        printf '%d 小时 %d 分钟' $((s / 3600)) $((s % 3600 / 60))
+    else
+        printf '%d 分钟' $((s / 60))
+    fi
 }
 
 ensure_dependencies() {
@@ -193,6 +259,24 @@ download_verified_package() {
         || fail '安装包 SHA-256 与官方发布信息不一致，已停止。'
 }
 
+installed_version() {
+    if [[ "$(dpkg-query -W -f='${Status}' sing-box 2>/dev/null || true)" == 'install ok installed' ]]; then
+        dpkg-query -W -f='${Version}' sing-box 2>/dev/null || true
+    fi
+}
+# 查询官方最新稳定版版本号；查询失败时输出为空，不会中断脚本。
+query_latest_version() {
+    command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1 || return 0
+    local arch
+    arch="$(dpkg --print-architecture 2>/dev/null)" || return 0
+    (
+        TEMP_DIR="$(mktemp -d)"
+        trap 'rm -rf -- "$TEMP_DIR"' EXIT
+        fetch_release_metadata latest "$arch" >/dev/null 2>&1
+        printf '%s' "$RELEASE_VERSION"
+    ) 2>/dev/null || true
+}
+
 save_manager() {
     local source_file="${BASH_SOURCE[0]}"
     [[ -f "$source_file" && "$source_file" != /dev/fd/* && "$source_file" != /proc/*/fd/* ]] \
@@ -204,20 +288,47 @@ save_manager() {
     fi
 }
 
+shortcut_is_ours() {
+    [[ -f "$SHORTCUT" ]] && grep -qF -- "$SHORTCUT_TAG" "$SHORTCUT" 2>/dev/null
+}
+# 创建快捷命令 anytls；参数 quiet 表示不显示提示。路径被其他程序占用时不覆盖。
+ensure_shortcut() {
+    local quiet="${1:-}"
+    [[ -f "$MANAGER" ]] || return 1
+    if [[ -e "$SHORTCUT" || -L "$SHORTCUT" ]]; then
+        shortcut_is_ours && return 0
+        [[ -n "$quiet" ]] || warn "$SHORTCUT 已被其他程序占用，未创建快捷命令；请继续使用 bash ${MANAGER}。"
+        return 1
+    fi
+    [[ -d /usr/local/bin ]] || return 1
+    printf '#!/usr/bin/env bash\n%s\nexec bash %s "$@"\n' "$SHORTCUT_TAG" "$MANAGER" > "$SHORTCUT" || return 1
+    chmod 755 "$SHORTCUT" || return 1
+    [[ -n "$quiet" ]] || ok "已创建快捷命令 anytls（等同于 bash ${MANAGER}）。"
+}
+# 提示里使用的命令名：有快捷命令时用 anytls，否则用完整路径。
+cmd_name() {
+    if shortcut_is_ours; then printf 'anytls'; else printf 'bash %s' "$MANAGER"; fi
+}
+
+# 删除节点在系统中的全部文件。安装时已确认这些路径原本不存在，因此可以整体删除。
+purge_node_files() {
+    systemctl disable --now sing-box >/dev/null 2>&1 || true
+    apt-get purge -y sing-box >/dev/null 2>&1 || warn '软件包卸载失败，请运行 dpkg-query -W sing-box 检查。' >&2
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    rm -rf -- /etc/sing-box /var/lib/sing-box
+    if getent passwd sing-box >/dev/null 2>&1; then userdel sing-box >/dev/null 2>&1 || true; fi
+    if getent group sing-box >/dev/null 2>&1; then groupdel sing-box >/dev/null 2>&1 || true; fi
+    rm -f -- "$SURGE_FILE" "$UNINSTALLER"
+}
+
 finish_install() {
     local result=$?
     trap - EXIT
     if (( INSTALL_COMMITTED == 0 )); then
         if (( INSTALL_STARTED )); then
-            say '安装未完成，正在撤销本次创建的服务和节点文件…' >&2
-            systemctl disable --now sing-box >/dev/null 2>&1 || true
-            apt-get purge -y sing-box >/dev/null 2>&1 || say '软件包清理失败，请运行 dpkg-query -W sing-box 检查。' >&2
-            rm -f -- "$CONFIG" "$MARKER" "$SURGE_FILE" /root/anytls-uninstall.sh
-            rm -rf -- "$ACME_DIR"
-            rmdir -- /etc/sing-box /var/lib/sing-box 2>/dev/null || true
-            if [[ -d /etc/sing-box || -d /var/lib/sing-box ]]; then
-                say '仍有安装目录未清空，请检查 /etc/sing-box 和 /var/lib/sing-box。' >&2
-            fi
+            if [[ -t 1 ]]; then printf '\n'; fi
+            warn '安装未完成，正在撤销本次创建的服务和节点文件…' >&2
+            purge_node_files
         fi
         if (( MANAGER_COPIED )); then rm -f -- "$MANAGER"; fi
     fi
@@ -226,85 +337,26 @@ finish_install() {
 }
 
 print_help() {
-    cat <<'EOF'
-AnyTLS 管理命令（在 VPS 上以 root 身份运行）：
-  bash /root/anytls-setup.sh            # 打开中文菜单
-  bash /root/anytls-setup.sh install    # 新 VPS 安装；按提示输入域名和端口
-  bash /root/anytls-setup.sh status     # 检查服务和证书
-  bash /root/anytls-setup.sh show       # 查看 Surge 节点行（含密码）
-  bash /root/anytls-setup.sh password   # 生成新密码；需更新 Surge 节点行
-  bash /root/anytls-setup.sh port       # 修改节点端口；需先放行新端口并更新 Surge
-  bash /root/anytls-setup.sh version    # 查看已安装版本及官方最新稳定版
-  bash /root/anytls-setup.sh update     # 手动升级已安装节点的 sing-box
-  bash /root/anytls-uninstall.sh        # 卸载本脚本安装的节点
-  bash /root/anytls-setup.sh help       # 再次显示本帮助
+    local cmd
+    cmd="$(cmd_name)"
+    cat <<EOF
+AnyTLS 节点管理脚本 v${SCRIPT_VERSION}（以 root 身份运行）
+用法：${cmd} [命令]
+  （不带命令）        打开中文管理菜单
+  install             安装节点；按提示输入域名、端口和节点名称
+  status              查看服务、证书剩余天数和 sing-box 版本
+  show                显示 Surge 节点行（含密码）
+  password            生成新密码；需更新 Surge 节点行
+  port [新端口]       修改节点端口；需先放行新端口并更新 Surge
+  rename [新名称]     修改节点名称；需更新 Surge 节点行
+  start|stop|restart  启动、停止、重启服务
+  log [-f|行数]       查看运行日志；-f 为实时查看
+  version             查看 sing-box 已安装版本和官方最新稳定版
+  update              升级 sing-box
+  self-update         更新本管理脚本
+  uninstall           卸载节点并清理残留
+  0–12                直接执行菜单中对应序号的操作
 EOF
-}
-
-interactive_menu() {
-    if [[ ! -t 0 ]]; then
-        print_help
-        return
-    fi
-    local choice
-    say
-    say '========== AnyTLS 节点管理 =========='
-    if [[ -f "$MARKER" && -f "$CONFIG" ]]; then
-        read_marker
-        say '检测到本脚本已配置的节点。'
-        say "当前节点：${MARKER_DOMAIN:-未知域名}:${MARKER_PORT:-未知端口}"
-        say '  1) 查看节点状态'
-        say '  2) 查看 Surge 节点行（含密码）'
-        say '  3) 修改密码'
-        say '  4) 修改端口'
-        say '  5) 查看版本'
-        say '  6) 升级 sing-box'
-        say '  7) 卸载节点'
-        say '  0) 退出'
-        while true; do
-            read -r -p '请输入序号并按回车：' choice || return 0
-            case "$choice" in
-                1) status_node; return ;;
-                2)
-                    say '复制下面整行到 Surge 配置文件的 [Proxy] 段：'
-                    show_node
-                    say '此行包含密码，请勿公开分享。'
-                    return ;;
-                3)
-                    say '修改后，Surge 中的旧密码会立即失效。'
-                    change_password
-                    return ;;
-                4)
-                    say '请先在服务商安全组放行准备使用的新端口。'
-                    change_port
-                    return ;;
-                5) version_node; return ;;
-                6) update_node; return ;;
-                7)
-                    uninstall_node
-                    return ;;
-                0) return 0 ;;
-                *) say '请输入 0–7 中的一个数字。' ;;
-            esac
-        done
-    else
-        say '当前没有检测到由本脚本安装的节点。'
-        if [[ -e /etc/sing-box || -e "$MARKER" ]]; then
-            say '发现已有 sing-box 文件；安装前会检查并保护这些文件。'
-        fi
-        say '  1) 安装新节点'
-        say '  2) 查看脚本版本'
-        say '  0) 退出'
-        while true; do
-            read -r -p '请输入序号并按回车：' choice || return 0
-            case "$choice" in
-                1) install_node; return ;;
-                2) version_node; return ;;
-                0) return 0 ;;
-                *) say '请输入 0、1 或 2。' ;;
-            esac
-        done
-    fi
 }
 
 load_metadata() {
@@ -322,17 +374,6 @@ load_metadata() {
     [[ -n "$NODE_NAME" ]] || NODE_NAME="AnyTLS-$(hostname -s)"
 }
 
-# 本机 TLS 握手并校验证书链与域名；握手输出保存在 TLS_OUTPUT，供读取证书到期时间。
-TLS_OUTPUT=''
-tls_ok() {
-    TLS_OUTPUT="$(timeout 6 openssl s_client \
-        -connect "127.0.0.1:${PORT}" \
-        -servername "$DOMAIN" \
-        -verify_hostname "$DOMAIN" \
-        -verify_return_error </dev/null 2>&1 || true)"
-    [[ "$TLS_OUTPUT" == *'Verify return code: 0 (ok)'* ]]
-}
-
 show_node() {
     need_root
     load_metadata
@@ -345,10 +386,20 @@ show_node() {
     printf '%s\n' "$line"
 }
 
+menu_show() {
+    say '复制下面整行到 Surge 配置文件的 [Proxy] 段：'
+    say
+    printf '%s' "$BOLD"
+    show_node
+    printf '%s' "$RESET"
+    say
+    warn '此行包含密码，请勿公开分享。'
+}
+
 check_install_eligibility() {
     if [[ -f "$MARKER" && -f "$CONFIG" ]]; then
         read_marker
-        fail "检测到本脚本已配置节点 ${MARKER_DOMAIN:-未知域名}:${MARKER_PORT:-未知端口}。请运行 bash /root/anytls-setup.sh 打开管理菜单。"
+        fail "检测到本脚本已配置节点 ${MARKER_DOMAIN:-未知域名}:${MARKER_PORT:-未知端口}。请运行 $(cmd_name) 打开管理菜单。"
     fi
     [[ ! -e "$MARKER" && ! -L "$MARKER" ]] || fail '检测到已有节点安装记录，但配置不完整；已停止以保护现有文件。'
     if command -v dpkg-query >/dev/null 2>&1 \
@@ -356,8 +407,8 @@ check_install_eligibility() {
         fail '检测到已有 sing-box 软件包记录。请先检查 dpkg-query -W sing-box；本脚本不会覆盖现有安装。'
     fi
     [[ ! -e /etc/sing-box && ! -L /etc/sing-box ]] || fail '/etc/sing-box 已存在，为避免覆盖配置，已停止。'
-    [[ ! -e /root/anytls-uninstall.sh && ! -L /root/anytls-uninstall.sh ]] || fail '/root/anytls-uninstall.sh 已存在，为避免覆盖，已停止。'
-    [[ ! -e "$ACME_DIR" && ! -L "$ACME_DIR" ]] || fail "$ACME_DIR 已存在，为避免覆盖证书数据，已停止。"
+    [[ ! -e /var/lib/sing-box && ! -L /var/lib/sing-box ]] || fail '/var/lib/sing-box 已存在，为避免覆盖数据，已停止。'
+    [[ ! -e "$UNINSTALLER" && ! -L "$UNINSTALLER" ]] || fail "$UNINSTALLER 已存在，为避免覆盖，已停止。"
     [[ ! -e "$SURGE_FILE" && ! -L "$SURGE_FILE" ]] || fail "$SURGE_FILE 已存在，为避免覆盖节点信息，已停止。"
     if command -v sing-box >/dev/null 2>&1; then
         fail '检测到已有 sing-box 程序；本脚本不会覆盖现有安装。'
@@ -371,46 +422,85 @@ install_node() {
     need_root
     [[ -f "${BASH_SOURCE[0]}" && "${BASH_SOURCE[0]}" != /dev/fd/* && "${BASH_SOURCE[0]}" != /proc/*/fd/* ]] \
         || fail '请先将脚本下载为普通文件再运行；不支持 curl | bash。'
-    [[ $# -le 3 ]] || fail '用法：bash anytls-setup.sh install [域名] [端口] [节点名称]'
+    [[ $# -le 3 ]] || fail "用法：$(cmd_name) install [域名] [端口] [节点名称]"
     check_install_eligibility
+    local interactive=0 raw_port="${2:-}" default_name answer
+    default_name="AnyTLS-$(hostname -s)"
+
     DOMAIN="${1:-}"
     if [[ -z "$DOMAIN" ]]; then
         [[ -t 0 ]] || fail '非交互运行时，请在命令中指定域名。'
+        interactive=1
         while true; do
-            read -r -p '请输入已解析到这台 VPS 的域名：' DOMAIN \
-                || fail '已取消输入。'
+            read -r -p '请输入已解析到这台 VPS 的域名：' DOMAIN || fail '已取消输入。'
             DOMAIN="${DOMAIN,,}"
             if valid_domain "$DOMAIN"; then break; fi
-            say '域名格式不对。只输入域名，例如 sg.example.com，不要带 https:// 或路径。' >&2
+            warn '域名格式不对。只输入域名，例如 sg.example.com，不要带 https:// 或路径。' >&2
         done
     fi
     DOMAIN="${DOMAIN,,}"
-    local raw_port="${2:-}"
-    NODE_NAME="${3:-AnyTLS-$(hostname -s)}"
     valid_domain "$DOMAIN" || fail '域名格式不对。只输入域名，例如 sg.example.com，不要带 https:// 或路径。'
+
     if [[ -z "$raw_port" ]]; then
         [[ -t 0 ]] || fail '非交互运行时，请在命令中指定端口。'
+        interactive=1
         while true; do
-            read -r -p '请输入 AnyTLS 节点 TCP 端口（1–65535，不能是 80）：' raw_port \
+            read -r -p '请输入节点 TCP 端口（1–65535，不能是 80；直接回车随机生成）：' raw_port \
                 || fail '已取消输入。'
-            if valid_port "$raw_port"; then
-                if ! command -v ss >/dev/null 2>&1 || port_free "$((10#$raw_port))"; then break; fi
-                say "本机 TCP $((10#$raw_port)) 已被占用，请换一个端口。" >&2
+            if [[ -z "$raw_port" ]]; then
+                if raw_port="$(random_port)"; then
+                    say "已随机选择端口：$raw_port"
+                    break
+                fi
+                warn '随机端口生成失败，请手动输入。' >&2
                 continue
             fi
-            say '端口无效，请输入 1–65535 的数字；TCP 80 留给证书验证。' >&2
+            if valid_port "$raw_port"; then
+                if ! command -v ss >/dev/null 2>&1 || port_free "$((10#$raw_port))"; then break; fi
+                warn "本机 TCP $((10#$raw_port)) 已被占用，请换一个端口。" >&2
+                continue
+            fi
+            warn '端口无效，请输入 1–65535 的数字；TCP 80 留给证书验证。' >&2
         done
     fi
     [[ "$raw_port" =~ ^[0-9]{1,5}$ ]] || fail '端口必须是 1–65535 的数字。'
     (( 10#$raw_port != 80 )) || fail 'TCP 80 需要留给证书申请，请另选节点端口。'
     valid_port "$raw_port" || fail '端口必须是 1–65535 的数字。'
     PORT="$((10#$raw_port))"
-    [[ "$NODE_NAME" != *','* && "$NODE_NAME" != *'='* && "$NODE_NAME" != *$'\n'* ]] \
-        || fail '节点名称不能包含逗号、等号或换行。'
+
+    NODE_NAME="${3:-}"
+    if [[ -z "$NODE_NAME" ]]; then
+        NODE_NAME="$default_name"
+        if (( interactive )); then
+            while true; do
+                read -r -p "请输入节点名称（直接回车使用 ${default_name}）：" answer || fail '已取消输入。'
+                [[ -n "$answer" ]] || break
+                if valid_node_name "$answer"; then
+                    NODE_NAME="$answer"
+                    break
+                fi
+                warn '节点名称不能超过 64 个字符，也不能包含逗号、等号或换行。' >&2
+            done
+        fi
+    fi
+    valid_node_name "$NODE_NAME" || fail '节点名称不能为空、不能超过 64 个字符，也不能包含逗号、等号或换行。'
+
+    if (( interactive )); then
+        say
+        step '—————————— 确认安装信息 ——————————'
+        say "  域名：$DOMAIN"
+        say "  端口：TCP $PORT"
+        say "  名称：$NODE_NAME"
+        warn "  请确认云安全组已放行 TCP 80 和 TCP ${PORT}"
+        step '————————————————————————————————'
+        if ! confirm '开始安装？[y/N]：'; then
+            say '已取消安装。'
+            return 0
+        fi
+    fi
+
     say
-    say "准备安装：$DOMAIN:$PORT"
-    say "请先在服务商安全组放行 TCP 80 和 ${PORT}；现有 SSH 端口请保持开放。"
-    say '[1/4] 检查系统和安装环境…'
+    step '[1/4] 检查系统和安装环境…'
     [[ -r /etc/os-release ]] || fail '无法识别系统。'
     # shellcheck source=/dev/null
     . /etc/os-release
@@ -423,11 +513,10 @@ install_node() {
         arm64|amd64) ;;
         *) fail "不支持的架构：$arch" ;;
     esac
-
     check_install_eligibility
     ensure_dependencies
 
-    say '[2/4] 检查域名解析和本机端口…'
+    step '[2/4] 检查域名解析和本机端口…'
     local dns_ips public_ip
     dns_ips="$(getent ahostsv4 "$DOMAIN" | awk '$2 == "STREAM" {print $1}' | sort -u)" \
         || fail "无法解析域名 ${DOMAIN}。"
@@ -435,8 +524,7 @@ install_node() {
     public_ip="$(public_ipv4)" || fail '无法查到此 VPS 的公网 IPv4。'
     [[ "$dns_ips" == "$public_ip" ]] \
         || fail "域名 $DOMAIN 解析到 ${dns_ips//$'\n'/, }，但这台 VPS 的公网 IPv4 是 ${public_ip}。请修正 A 记录，生效后重试。"
-    say "域名已指向这台 VPS：$public_ip"
-
+    ok "域名已指向这台 VPS：$public_ip"
     local check_port
     for check_port in 80 "$PORT"; do
         port_free "$check_port" || fail "本机 TCP $check_port 已被占用。"
@@ -446,19 +534,19 @@ install_node() {
     trap finish_install EXIT
     save_manager
     TEMP_DIR="$(mktemp -d)"
-    say '[3/4] 查询官方最新稳定版…'
+    step '[3/4] 下载并安装 sing-box 官方最新稳定版…'
     fetch_release_metadata latest "$arch"
-    say "下载并校验 sing-box $RELEASE_VERSION ($arch)…"
+    say "下载 sing-box $RELEASE_VERSION ($arch)…"
     download_verified_package "$TEMP_DIR/sing-box.deb"
-    say '安装包 SHA-256 校验通过。'
+    ok '安装包 SHA-256 校验通过。'
     INSTALL_STARTED=1
     dpkg -i "$TEMP_DIR/sing-box.deb"
-    say '[4/4] 配置节点并申请证书…'
+
+    step '[4/4] 配置节点并申请证书…'
     systemctl stop sing-box >/dev/null 2>&1 || true
     install -d -m 755 /etc/sing-box
     write_marker "$DOMAIN" "$PORT" "$NODE_NAME"
     getent passwd sing-box >/dev/null || fail '安装后未发现 sing-box 系统用户。'
-
     password="$(gen_password)"
     install -d -o sing-box -g sing-box -m 700 "$ACME_DIR"
     cat > "$CONFIG" <<EOF
@@ -495,78 +583,115 @@ EOF
     runuser -u sing-box -- /usr/bin/sing-box check -c "$CONFIG"
     systemctl enable --now sing-box
 
-    say '等待 Let’s Encrypt 签发证书并验证 TLS（最长约两分钟）…'
-    local deadline=$((SECONDS + 120))
+    say '等待 Let’s Encrypt 签发证书并验证 TLS（最长约 2 分钟）…'
+    local start=$SECONDS deadline=$((SECONDS + 120))
     while (( SECONDS < deadline )); do
         if tls_ok; then
-            cat > /root/anytls-uninstall.sh <<'EOF'
+            if [[ -t 1 ]]; then printf '\r\033[K'; fi
+            cat > "$UNINSTALLER" <<EOF
 #!/usr/bin/env bash
 set -Eeuo pipefail
-[[ $EUID -eq 0 ]] || { echo '请以 root 身份运行。' >&2; exit 1; }
-exec bash /root/anytls-setup.sh uninstall
+[[ \$EUID -eq 0 ]] || { echo '请以 root 身份运行。' >&2; exit 1; }
+exec bash $MANAGER uninstall
 EOF
-            chmod 700 /root/anytls-uninstall.sh
+            chmod 700 "$UNINSTALLER"
             show_node >/dev/null
             INSTALL_COMMITTED=1
-            say '完成：服务已运行，证书链和域名验证通过。'
-            say 'Surge 节点（复制下一行到配置文件的 [Proxy] 段）：'
-            cat -- "$SURGE_FILE"
-            say "节点行已保存到 ${SURGE_FILE}；以后运行 bash /root/anytls-setup.sh show 可重新输出。"
-            say "请在云安全组放行 TCP ${PORT}，并保持 TCP 80 开放以供证书续签。"
-            say
-            print_help
+            ok '证书签发成功，TLS 验证通过。'
+            ensure_shortcut || true
+            print_install_result
             return 0
         fi
         sleep 5
+        if [[ -t 1 ]]; then printf '\r  已等待 %d 秒（最长 120 秒）…' $((SECONDS - start)); fi
     done
-    say "尚未验证到有效证书，本次安装将自动撤销。请检查域名解析及云安全组 TCP 80，再重新运行 install。" >&2
+    if [[ -t 1 ]]; then printf '\n'; fi
+    warn '尚未验证到有效证书，本次安装将自动撤销。请检查域名解析及云安全组 TCP 80，再重新运行安装。' >&2
     say '查看签发错误：journalctl -u sing-box -n 60 --no-pager' >&2
     return 1
+}
+
+print_install_result() {
+    local cmd
+    cmd="$(cmd_name)"
+    say
+    printf '%s%s================ 安装完成 ================%s\n' "$GREEN" "$BOLD" "$RESET"
+    say '复制下面这一行到 Surge 配置文件的 [Proxy] 段：'
+    say
+    printf '%s%s%s\n' "$BOLD" "$(cat -- "$SURGE_FILE")" "$RESET"
+    say
+    say "（已保存到 ${SURGE_FILE}；此行含密码，请勿外传）"
+    printf '%s%s==========================================%s\n' "$GREEN" "$BOLD" "$RESET"
+    say '常用命令：'
+    printf '  %-30s %s\n' "$cmd" '打开管理菜单' "$cmd show" '再次显示节点行' "$cmd status" '检查节点状态'
+    warn '提醒：保持 TCP 80 开放，证书才能自动续期。'
 }
 
 status_node() {
     need_root
     load_metadata
-    local cert_expiry listeners service_ok=0 port_ok=0 tls_verified=0
+    local listeners service_ok=0 port_ok=0 tls_verified=0
+    local since since_epoch cert_end end_epoch days color installed latest
     say "节点名称：$NODE_NAME"
-    say "服务器：$DOMAIN:$PORT"
+    say "服务器：  $DOMAIN:$PORT"
     if systemctl is-active --quiet sing-box; then
-        say '服务状态：运行中'
         service_ok=1
+        since="$(systemctl show sing-box -p ActiveEnterTimestamp --value 2>/dev/null || true)"
+        if [[ -n "$since" ]] && since_epoch="$(date -d "$since" +%s 2>/dev/null)"; then
+            say "服务状态：${GREEN}运行中${RESET}（已运行 $(format_duration $(( $(date +%s) - since_epoch )))）"
+        else
+            say "服务状态：${GREEN}运行中${RESET}"
+        fi
     else
-        say '服务状态：未运行'
+        say "服务状态：${RED}未运行${RESET}"
     fi
     if listeners="$(ss -H -ltn "sport = :$PORT" 2>/dev/null)"; then
         if [[ -n "$listeners" ]]; then
-            say "本机端口：TCP $PORT 已监听"
+            say "本机端口：${GREEN}TCP $PORT 已监听${RESET}"
             port_ok=1
         else
-            say "本机端口：TCP $PORT 未监听"
+            say "本机端口：${RED}TCP $PORT 未监听${RESET}"
         fi
     else
         say '本机端口：无法检查，请运行 ss -lntp 查看。'
     fi
     if tls_ok; then
-        say 'TLS 证书：验证通过'
         tls_verified=1
-        cert_expiry="$(openssl x509 -noout -enddate <<< "$TLS_OUTPUT" 2>/dev/null || true)"
-        if [[ -n "$cert_expiry" ]]; then say "证书到期：${cert_expiry#notAfter=}"; fi
+        say "TLS 证书：${GREEN}验证通过${RESET}"
+        cert_end="$(openssl x509 -noout -enddate <<< "$TLS_OUTPUT" 2>/dev/null || true)"
+        cert_end="${cert_end#notAfter=}"
+        if [[ -n "$cert_end" ]] && end_epoch="$(date -d "$cert_end" +%s 2>/dev/null)"; then
+            days=$(( (end_epoch - $(date +%s)) / 86400 ))
+            if (( days > 20 )); then color="$GREEN"; elif (( days > 7 )); then color="$YELLOW"; else color="$RED"; fi
+            say "证书到期：$(date -d "@$end_epoch" +%F)（${color}还剩 ${days} 天${RESET}）"
+            if (( days <= 20 )); then
+                warn '证书剩余时间偏少：正常会在到期前约 30 天自动续期，请检查 TCP 80 是否可从外网访问。'
+            fi
+        elif [[ -n "$cert_end" ]]; then
+            say "证书到期：$cert_end"
+        fi
     else
-        say 'TLS 证书：验证未通过'
+        say "TLS 证书：${RED}验证未通过${RESET}"
+    fi
+    installed="$(installed_version)"
+    latest="$(query_latest_version)"
+    if [[ -n "$installed" && -n "$latest" ]] && dpkg --compare-versions "$latest" gt "$installed"; then
+        say "sing-box：$installed（${YELLOW}可升级到 ${latest}${RESET}，运行 $(cmd_name) update）"
+    elif [[ -n "$installed" && -n "$latest" ]]; then
+        say "sing-box：$installed（已是最新稳定版）"
+    else
+        say "sing-box：${installed:-未知}（无法查询官方最新版本）"
     fi
     say '外部连接：请用 Surge 实测；本机检查无法确认云安全组是否放行。'
     say '证书续签：需保持 TCP 80 可从外部访问。'
     if (( service_ok == 0 || port_ok == 0 || tls_verified == 0 )); then
-        say '排查日志：journalctl -u sing-box -n 30 --no-pager'
+        warn "排查日志：$(cmd_name) log"
     fi
 }
 
 version_node() {
     local installed arch
-    installed=''
-    if [[ "$(dpkg-query -W -f='${Status}' sing-box 2>/dev/null || true)" == 'install ok installed' ]]; then
-        installed="$(dpkg-query -W -f='${Version}' sing-box 2>/dev/null || true)"
-    fi
+    installed="$(installed_version)"
     say "已安装版本：${installed:-未安装}"
     if ! command -v curl >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
         say '无法检查官方版本：缺少 curl 或 jq；安装节点或运行 update 时会自动补齐。'
@@ -579,9 +704,9 @@ version_node() {
     say "官方最新稳定版：$RELEASE_VERSION"
     if [[ -n "$installed" ]]; then
         if dpkg --compare-versions "$RELEASE_VERSION" gt "$installed"; then
-            say '有新版本。运行 bash /root/anytls-setup.sh update 手动升级。'
+            warn "有新版本。运行 $(cmd_name) update 手动升级。"
         else
-            say '当前已是最新稳定版，或已安装版本更新。'
+            ok '当前已是最新稳定版，或已安装版本更新。'
         fi
     fi
 }
@@ -595,7 +720,7 @@ update_node() {
     [[ "$installed" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
         || fail "已安装版本格式不受支持：${installed}。请先检查软件包来源。"
     systemctl is-active --quiet sing-box && tls_ok \
-        || fail '升级前服务或 TLS 验证未通过。请先运行 status 排查。'
+        || fail "升级前服务或 TLS 验证未通过。请先运行 $(cmd_name) status 排查。"
     arch="$(dpkg --print-architecture)"
     ensure_dependencies
     TEMP_DIR="$(mktemp -d)"
@@ -605,7 +730,7 @@ update_node() {
     fetch_release_metadata latest "$arch"
     new_version="$RELEASE_VERSION"
     if ! dpkg --compare-versions "$new_version" gt "$installed"; then
-        say "当前版本 ${installed}；官方最新稳定版 ${new_version}。无需升级。"
+        ok "当前版本 ${installed}；官方最新稳定版 ${new_version}。无需升级。"
         return 0
     fi
     say "准备从 sing-box $installed 升级到 ${new_version}。"
@@ -630,17 +755,17 @@ update_node() {
         verified=1
     fi
     if (( verified )); then
-        say "升级完成：sing-box ${new_version}。节点域名、端口和密码未变。"
+        ok "升级完成：sing-box ${new_version}。节点域名、端口和密码未变。"
         return 0
     fi
 
-    say '升级或验证失败，正在恢复原版本…' >&2
+    warn '升级或验证失败，正在恢复原版本…' >&2
     cp -a -- "$TEMP_DIR/config.backup" "$CONFIG" || restored=0
     dpkg -i "$TEMP_DIR/old.deb" || restored=0
     systemctl daemon-reload || restored=0
     systemctl restart sing-box || restored=0
     if (( restored )) && systemctl is-active --quiet sing-box && tls_ok; then
-        fail "升级失败，已恢复 sing-box ${old_version}；请检查 journalctl -u sing-box -n 60 --no-pager。"
+        fail "升级失败，已恢复 sing-box ${old_version}；请运行 $(cmd_name) log 查看日志。"
     fi
     recovery_dir="$TEMP_DIR"
     TEMP_DIR=''
@@ -668,28 +793,36 @@ change_password() {
         systemctl restart sing-box || true
         fail '修改或重启失败，已恢复原密码；请检查 systemctl status sing-box。'
     fi
-    rm -f -- "$backup" || say "提醒：旧配置备份清理失败，请检查 ${backup}。" >&2
-    say '密码已更换。将下面这一行替换到 Surge 配置文件的 [Proxy] 段：'
+    rm -f -- "$backup" || warn "提醒：旧配置备份清理失败，请检查 ${backup}。" >&2
+    ok '密码已更换。将下面这一行替换到 Surge 配置文件的 [Proxy] 段：'
     show_node
-    say "节点行也已保存到 ${SURGE_FILE}。请勿把含密码的节点行发到聊天中。"
+    warn "节点行也已保存到 ${SURGE_FILE}。请勿把含密码的节点行发到聊天中。"
 }
 
 change_port() {
     need_root
-    [[ $# -le 1 ]] || fail '用法：bash anytls-setup.sh port [新端口]'
+    [[ $# -le 1 ]] || fail "用法：$(cmd_name) port [新端口]"
     load_metadata
     local old_port="$PORT" raw_port="${1:-}" new_port match_count backup_dir verified=0
     if [[ -z "$raw_port" ]]; then
         [[ -t 0 ]] || fail '非交互运行时，请在命令中指定新端口。'
         while true; do
-            read -r -p "当前端口 ${old_port}；请输入新的 AnyTLS TCP 端口：" raw_port \
+            read -r -p "当前端口 ${old_port}；请输入新的 TCP 端口（直接回车随机生成）：" raw_port \
                 || fail '已取消输入。'
-            if valid_port "$raw_port" && (( 10#$raw_port != old_port )); then
-                if port_free "$((10#$raw_port))"; then break; fi
-                say "本机 TCP $((10#$raw_port)) 已被占用，请换一个端口。" >&2
+            if [[ -z "$raw_port" ]]; then
+                if raw_port="$(random_port)" && (( raw_port != old_port )); then
+                    say "已随机选择端口：$raw_port"
+                    break
+                fi
+                warn '随机端口生成失败，请手动输入。' >&2
                 continue
             fi
-            say "端口无效。请输入 1–65535 的数字，不能是 TCP 80 或当前端口 ${old_port}。" >&2
+            if valid_port "$raw_port" && (( 10#$raw_port != old_port )); then
+                if port_free "$((10#$raw_port))"; then break; fi
+                warn "本机 TCP $((10#$raw_port)) 已被占用，请换一个端口。" >&2
+                continue
+            fi
+            warn "端口无效。请输入 1–65535 的数字，不能是 TCP 80 或当前端口 ${old_port}。" >&2
         done
     fi
     [[ "$raw_port" =~ ^[0-9]{1,5}$ ]] || fail '端口必须是 1–65535 的数字。'
@@ -725,57 +858,285 @@ change_port() {
         cp -a -- "$backup_dir/config.json" "$CONFIG" || fail "恢复配置失败，原备份保留在 ${backup_dir}。"
         cp -a -- "$backup_dir/.anytls-setup-owned" "$MARKER" || fail "恢复安装记录失败，原备份保留在 ${backup_dir}。"
         PORT="$old_port"
-        systemctl restart sing-box || say '旧配置已恢复，但服务重启失败；请检查 systemctl status sing-box。' >&2
-        rm -rf -- "$backup_dir" || say "提醒：旧配置备份清理失败，请检查 ${backup_dir}。" >&2
+        systemctl restart sing-box || warn '旧配置已恢复，但服务重启失败；请检查 systemctl status sing-box。' >&2
+        rm -rf -- "$backup_dir" || warn "提醒：旧配置备份清理失败，请检查 ${backup_dir}。" >&2
         fail "新端口 $new_port 启动或 TLS 验证失败，已恢复旧端口 ${old_port}；请查看 systemctl status sing-box。"
     fi
-    rm -rf -- "$backup_dir" || say "提醒：旧配置备份清理失败，请检查 ${backup_dir}。" >&2
-    say "已从 TCP $old_port 切换到 TCP ${new_port}。请将下面的新节点行替换到 Surge 的 [Proxy] 段："
+    rm -rf -- "$backup_dir" || warn "提醒：旧配置备份清理失败，请检查 ${backup_dir}。" >&2
+    ok "已从 TCP $old_port 切换到 TCP ${new_port}。请将下面的新节点行替换到 Surge 的 [Proxy] 段："
     show_node
-    say "确认 Surge 可连接后，再关闭云安全组中的旧端口 ${old_port}。TCP 80 仍需保持开放。"
-    say '请勿把含密码的节点行发到聊天中。'
+    warn "确认 Surge 可连接后，再关闭云安全组中的旧端口 ${old_port}。TCP 80 仍需保持开放。"
+    warn '请勿把含密码的节点行发到聊天中。'
 }
 
-confirm_uninstall() {
-    local answer
-    while true; do
-        read -r -p '确定卸载节点？[y/N]（直接回车默认 n）：' answer || { say '已取消卸载。'; return 1; }
-        case "$answer" in
-            y|Y) return 0 ;;
-            n|N|'') say '已取消卸载。'; return 1 ;;
-            *) say '请输入 y 或 n。' ;;
-        esac
-    done
+rename_node() {
+    need_root
+    [[ $# -le 1 ]] || fail "用法：$(cmd_name) rename [新名称]"
+    load_metadata
+    local new_name="${1:-}"
+    if [[ -z "$new_name" ]]; then
+        [[ -t 0 ]] || fail '非交互运行时，请在命令中指定新名称。'
+        say "当前节点名称：$NODE_NAME"
+        while true; do
+            read -r -p '请输入新的节点名称：' new_name || fail '已取消输入。'
+            if valid_node_name "$new_name" && [[ "$new_name" != "$NODE_NAME" ]]; then break; fi
+            warn '名称无效：不能为空、不能与当前名称相同、不能超过 64 个字符，也不能包含逗号、等号或换行。' >&2
+        done
+    fi
+    valid_node_name "$new_name" || fail '节点名称不能为空、不能超过 64 个字符，也不能包含逗号、等号或换行。'
+    [[ "$new_name" != "$NODE_NAME" ]] || fail '新名称与当前名称相同。'
+    write_marker "$DOMAIN" "$PORT" "$new_name" || fail '写入安装记录失败，名称未修改。'
+    ok "节点名称已改为 ${new_name}，服务无需重启。将下面这一行替换到 Surge 配置文件的 [Proxy] 段："
+    show_node
+}
+
+start_node() {
+    need_root
+    load_metadata
+    if systemctl is-active --quiet sing-box; then
+        ok '服务已在运行。'
+        return 0
+    fi
+    systemctl start sing-box || fail "启动失败；运行 $(cmd_name) log 查看日志。"
+    say '正在验证 TLS…'
+    wait_tls 5 || fail "服务已启动，但 TLS 验证未通过；运行 $(cmd_name) log 查看日志。"
+    ok '服务已启动，TLS 验证通过。'
+}
+
+stop_node() {
+    need_root
+    load_metadata
+    if ! systemctl is-active --quiet sing-box; then
+        ok '服务已处于停止状态。'
+        return 0
+    fi
+    if [[ -t 0 ]] && ! confirm '停止后节点将无法连接，确定停止？[y/N]：'; then
+        say '已取消。'
+        return 0
+    fi
+    systemctl stop sing-box || fail '停止服务失败。'
+    ok "服务已停止。需要恢复时运行 $(cmd_name) start。"
+    warn '注意：服务停止期间证书不会自动续期；重启 VPS 后服务会自动启动。'
+}
+
+restart_node() {
+    need_root
+    load_metadata
+    say '正在重启服务…'
+    systemctl restart sing-box || fail "重启失败；运行 $(cmd_name) log 查看日志。"
+    wait_tls 5 || fail "服务已重启，但 TLS 验证未通过；运行 $(cmd_name) log 查看日志。"
+    ok '服务已重启，TLS 验证通过。'
+}
+
+log_node() {
+    need_root
+    [[ $# -le 1 ]] || fail "用法：$(cmd_name) log [-f|行数]"
+    local arg="${1:-50}"
+    if [[ "$arg" == -f ]]; then
+        say '实时查看日志，按 Ctrl+C 退出。'
+        journalctl -u sing-box -f --no-pager
+        return 0
+    fi
+    [[ "$arg" =~ ^[0-9]{1,5}$ ]] || fail '行数必须是数字，例如 log 100。'
+    journalctl -u sing-box -n "$arg" --no-pager
+}
+
+download_file() {
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --retry 3 --connect-timeout 10 --max-time 60 -o "$2" "$1"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q -T 30 -t 3 -O "$2" "$1"
+    else
+        return 1
+    fi
+}
+
+self_update() {
+    need_root
+    local new remote_ver
+    TEMP_DIR="$(mktemp -d /root/.anytls-update.XXXXXX)"
+    trap cleanup_temp EXIT
+    new="$TEMP_DIR/anytls-setup.sh"
+    say "当前脚本版本：v${SCRIPT_VERSION}，正在检查最新版本…"
+    download_file "$SCRIPT_URL" "$new" || fail '下载最新脚本失败，请检查网络后重试；旧脚本保持不变。'
+    [[ -s "$new" && "$(head -n 1 "$new")" == '#!/usr/bin/env bash' ]] && grep -qF 'anytls-setup-owned' "$new" \
+        || fail '下载的文件不是 AnyTLS 管理脚本，已停止；旧脚本保持不变。'
+    bash -n "$new" || fail '新脚本语法检查未通过，已停止；旧脚本保持不变。'
+    remote_ver="$(sed -n "s/^SCRIPT_VERSION='\([^']*\)'.*/\1/p" "$new" | head -n 1)"
+    rm -f -- /root/anytls-setup.new.sh
+    if [[ -f "$MANAGER" ]] && cmp -s -- "$new" "$MANAGER"; then
+        ok "当前已是最新版本：v${remote_ver:-$SCRIPT_VERSION}"
+        ensure_shortcut || true
+        return 0
+    fi
+    say "发现新版本：v${remote_ver:-未知}（当前 v${SCRIPT_VERSION}）"
+    if [[ -t 0 ]] && ! confirm '是否更新？[Y/n]：' y; then
+        say '已取消更新。'
+        return 0
+    fi
+    chmod 700 "$new"
+    mv -f -- "$new" "$MANAGER" || fail '替换脚本失败；旧脚本保持不变。'
+    ensure_shortcut || true
+    ok "管理脚本已更新到 v${remote_ver:-最新版本}。"
 }
 
 uninstall_node() {
     need_root
     [[ -f "$MARKER" ]] || fail '未发现本脚本安装的节点，已停止以保护现有服务。'
-    confirm_uninstall || return 0
-    systemctl disable --now sing-box >/dev/null 2>&1 || true
-    apt-get purge -y sing-box
-    rm -f -- "$CONFIG" "$MARKER" "$SURGE_FILE" /etc/sing-box/config.json.backup.* /etc/sing-box/.config.json.*
-    rm -rf -- /etc/sing-box/.port-backup.*
-    rm -rf -- "$ACME_DIR"
-    rmdir -- /etc/sing-box /var/lib/sing-box 2>/dev/null || true
-    rm -f -- /root/anytls-uninstall.sh "$MANAGER" /root/anytls-setup.new.sh
-    say '已移除本脚本安装的 sing-box、配置和证书数据。'
-    if [[ -d /etc/sing-box || -d /var/lib/sing-box ]]; then
-        say '部分目录还含有其他文件，已保留；可用 ls -la /etc/sing-box /var/lib/sing-box 检查。'
+    if ! confirm '确定卸载节点并清理全部残留？[y/N]（直接回车默认 n）：'; then
+        say '已取消卸载。'
+        return 0
     fi
-    say '云安全组规则、域名 DNS 记录和 Surge 节点如不再使用，请自行删除。'
+    say '正在卸载…'
+    purge_node_files
+    if shortcut_is_ours; then rm -f -- "$SHORTCUT"; fi
+    rm -f -- "$MANAGER" /root/anytls-setup.new.sh
+    rm -rf -- /root/.anytls-update.*
+    ok '卸载完成，已清理：'
+    say '  · sing-box 程序、系统服务和 sing-box 系统用户'
+    say '  · /etc/sing-box（配置、安装记录、备份）和 /var/lib/sing-box（证书、缓存）'
+    say "  · ${SURGE_FILE}、${UNINSTALLER}、${MANAGER} 和更新时的临时文件"
+    say "  · 快捷命令 ${SHORTCUT}"
+    warn '以下内容在 VPS 之外，如不再使用请自行删除：域名 DNS 记录、云安全组规则、Surge 中的节点配置。'
 }
 
-case "${1:-}" in
-    '') interactive_menu ;;
-    help|-h|--help) print_help ;;
-    install) shift; install_node "$@" ;;
-    status) status_node ;;
-    show) show_node ;;
-    password) change_password ;;
-    port) shift; change_port "$@" ;;
-    version) version_node ;;
-    update) update_node ;;
-    uninstall) uninstall_node ;;
-    *) print_help; exit 2 ;;
-esac
+# 菜单底部的状态行。
+menu_status() {
+    local state label color ver
+    if [[ ! -f "$MARKER" || ! -f "$CONFIG" ]]; then
+        say " 当前状态：${RED}● 未安装${RESET}"
+        return 0
+    fi
+    ver="$(installed_version)"
+    state="$(systemctl is-active sing-box 2>/dev/null || true)"
+    case "$state" in
+        active) color="$GREEN"; label='运行中' ;;
+        activating|reloading) color="$YELLOW"; label='启动中' ;;
+        failed) color="$RED"; label='运行失败' ;;
+        inactive) color="$YELLOW"; label='已停止' ;;
+        *) color="$YELLOW"; label="状态未知（${state:-无}）" ;;
+    esac
+    say " 当前状态：${GREEN}● 已安装${RESET} [sing-box ${ver:-未知}]  ${color}● ${label}${RESET}"
+    read_marker
+    say " 当前节点：${MARKER_NAME:-未命名}（${MARKER_DOMAIN:-未知域名}:${MARKER_PORT:-未知端口}）"
+}
+
+show_menu() {
+    local installed upgrade_tag=''
+    installed="$(installed_version)"
+    if [[ -n "$LATEST_VERSION" && -n "$installed" ]] \
+        && dpkg --compare-versions "$LATEST_VERSION" gt "$installed" 2>/dev/null; then
+        upgrade_tag="  ${YELLOW}(可升级到 ${LATEST_VERSION})${RESET}"
+    fi
+    if [[ -t 1 ]]; then clear 2>/dev/null || true; fi
+    say '=============================='
+    say " AnyTLS 节点管理脚本 ${RED}[v${SCRIPT_VERSION}]${RESET}"
+    say '=============================='
+    say "  ${GREEN}0.${RESET} 更新脚本"
+    say '——————————————————————————————'
+    say "  ${GREEN}1.${RESET} 安装节点"
+    say "  ${GREEN}2.${RESET} 卸载节点（含清理残留）"
+    say "  ${GREEN}3.${RESET} 升级 sing-box${upgrade_tag}"
+    say '——————————————————————————————'
+    say "  ${GREEN}4.${RESET} 启动服务"
+    say "  ${GREEN}5.${RESET} 停止服务"
+    say "  ${GREEN}6.${RESET} 重启服务"
+    say '——————————————————————————————'
+    say "  ${GREEN}7.${RESET} 修改密码"
+    say "  ${GREEN}8.${RESET} 修改端口"
+    say "  ${GREEN}9.${RESET} 修改节点名称"
+    say '——————————————————————————————'
+    say " ${GREEN}10.${RESET} 查看节点行"
+    say " ${GREEN}11.${RESET} 查看运行状态"
+    say " ${GREEN}12.${RESET} 查看运行日志"
+    say '——————————————————————————————'
+    say " ${GREEN}00.${RESET} 退出"
+    say '=============================='
+    menu_status
+    say
+}
+
+menu_action() {
+    case "$1" in
+        0) self_update ;;
+        1) install_node ;;
+        2) uninstall_node ;;
+        3) update_node ;;
+        4) start_node ;;
+        5) stop_node ;;
+        6) restart_node ;;
+        7) warn '修改后，Surge 中的旧密码会立即失效。'; change_password ;;
+        8) warn '请先在服务商安全组放行准备使用的新端口。'; change_port ;;
+        9) rename_node ;;
+        10) menu_show ;;
+        11) status_node ;;
+        12) log_node ;;
+        *) return 2 ;;
+    esac
+}
+
+interactive_menu() {
+    if [[ ! -t 0 ]]; then
+        print_help
+        return 0
+    fi
+    need_root
+    ensure_shortcut quiet || true
+    local choice rc before dummy
+    if [[ -f "$MARKER" ]]; then
+        say '正在检查 sing-box 新版本…'
+        LATEST_VERSION="$(query_latest_version)"
+    fi
+    while true; do
+        show_menu
+        read -r -p ' 请输入数字 [0-12，00 退出]：' choice || { say; return 0; }
+        case "$choice" in
+            00|q|Q) return 0 ;;
+            [0-9]|1[0-2]) ;;
+            *) warn ' 请输入菜单中的数字。'; sleep 1; continue ;;
+        esac
+        before="$(cksum "$MANAGER" 2>/dev/null || true)"
+        say
+        # 每项操作在子进程中运行：出错只结束这一项，不会退出菜单。
+        set +e
+        ( set -e; menu_action "$choice" )
+        rc=$?
+        set -e
+        if [[ "$choice" == 0 && -f "$MANAGER" && "$(cksum "$MANAGER")" != "$before" ]]; then
+            ok '正在打开新版本脚本…'
+            sleep 1
+            exec bash "$MANAGER"
+        fi
+        if [[ "$choice" == 2 && ! -f "$MANAGER" ]]; then
+            return 0
+        fi
+        if (( rc != 0 )); then say; fi
+        say
+        read -r -p "${YELLOW}* 按回车返回主菜单 *${RESET}" dummy || { say; return 0; }
+    done
+}
+
+main() {
+    case "${1:-}" in
+        '') interactive_menu ;;
+        help|-h|--help) print_help ;;
+        install) shift; install_node "$@" ;;
+        status) status_node ;;
+        show) show_node ;;
+        password) change_password ;;
+        port) shift; change_port "$@" ;;
+        rename) shift; rename_node "$@" ;;
+        start) start_node ;;
+        stop) stop_node ;;
+        restart) restart_node ;;
+        log|logs) shift; log_node "$@" ;;
+        version) version_node ;;
+        update) update_node ;;
+        self-update|update-script) self_update ;;
+        uninstall) uninstall_node ;;
+        [0-9]|1[0-2]) need_root; menu_action "$1" ;;
+        *) print_help; exit 2 ;;
+    esac
+}
+
+main "$@"
