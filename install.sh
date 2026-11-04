@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION='2.0.0'
+SCRIPT_VERSION='2.1.0'
 SCRIPT_URL='https://raw.githubusercontent.com/Soulleslie/anytls-/main/install.sh'
 DOMAIN=''
 PORT=''
@@ -22,12 +22,18 @@ MANAGER='/root/anytls-setup.sh'
 UNINSTALLER='/root/anytls-uninstall.sh'
 SHORTCUT='/usr/local/bin/anytls'
 SHORTCUT_TAG='# anytls-setup shortcut'
+TFO_SYSCTL='/etc/sysctl.d/99-anytls-tfo.conf'
+TFO_TAG='# anytls-setup: TCP Fast Open'
 TEMP_DIR=''
 TLS_OUTPUT=''
 LATEST_VERSION=''
 MARKER_DOMAIN=''
 MARKER_PORT=''
 MARKER_NAME=''
+MARKER_MODE='domain'
+MARKER_IP=''
+ADDR_MODE='domain'
+ADDR_IP=''
 INSTALL_STARTED=0
 INSTALL_COMMITTED=0
 MANAGER_COPIED=0
@@ -82,16 +88,25 @@ gen_password() {
     [[ ${#pw} -eq 48 ]] || fail '随机密码生成失败。'
     printf '%s' "$pw"
 }
-# 读取安装记录：第 1 行域名，第 2 行端口，第 3 行节点名。
+# 读取安装记录：第 1 行域名，第 2 行端口，第 3 行节点名，
+# 第 4 行节点行地址模式（domain/ip，旧记录没有时视为 domain），第 5 行 IP 模式下的 IP。
 read_marker() {
     local lines=()
     mapfile -t lines < "$MARKER" 2>/dev/null || true
     MARKER_DOMAIN="${lines[0]:-}"
     MARKER_PORT="${lines[1]:-}"
     MARKER_NAME="${lines[2]:-}"
+    MARKER_MODE="${lines[3]:-domain}"
+    MARKER_IP="${lines[4]:-}"
+    if [[ "$MARKER_MODE" != ip || ! "$MARKER_IP" =~ ^[0-9]{1,3}([.][0-9]{1,3}){3}$ ]]; then
+        MARKER_MODE=domain
+        MARKER_IP=''
+    fi
 }
+# 参数：域名 端口 节点名 [地址模式] [IP]；省略的地址字段沿用当前值。
 write_marker() {
-    printf '%s\n%s\n%s\n' "$1" "$2" "$3" > "$MARKER" && chmod 600 "$MARKER"
+    printf '%s\n%s\n%s\n%s\n%s\n' "$1" "$2" "$3" "${4:-$ADDR_MODE}" "${5-$ADDR_IP}" > "$MARKER" \
+        && chmod 600 "$MARKER"
 }
 config_password() {
     jq -er '[.inbounds[] | select(.type == "anytls") | .users[0].password][0] | select(type == "string")' "$CONFIG" 2>/dev/null
@@ -150,6 +165,53 @@ confirm() {
         esac
     done
 }
+# TCP Fast Open 需要两处同时开启：sing-box 入站的 tcp_fast_open，以及内核 net.ipv4.tcp_fastopen 的服务端位（2）。
+config_tfo_enabled() {
+    [[ "$(jq -r '[.inbounds[] | select(.type == "anytls") | .tcp_fast_open][0] // false' "$CONFIG" 2>/dev/null)" == true ]]
+}
+kernel_tfo_value() {
+    local v
+    v="$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || cat /proc/sys/net/ipv4/tcp_fastopen 2>/dev/null || true)"
+    [[ "$v" =~ ^[0-9]+$ ]] || v=0
+    printf '%s' "$v"
+}
+kernel_tfo_server() {
+    (( $(kernel_tfo_value) & 2 ))
+}
+tfo_active() {
+    config_tfo_enabled && kernel_tfo_server
+}
+tfo_sysctl_is_ours() {
+    [[ -f "$TFO_SYSCTL" ]] && grep -qF -- "$TFO_TAG" "$TFO_SYSCTL" 2>/dev/null
+}
+# 开启内核服务端 TFO 并持久化；原值记在 sysctl 文件里，关闭或卸载时恢复。
+enable_kernel_tfo() {
+    local orig current new
+    current="$(kernel_tfo_value)"
+    orig="$current"
+    if tfo_sysctl_is_ours; then
+        orig="$(sed -n 's/^# original=\([0-9]*\)$/\1/p' "$TFO_SYSCTL" | head -n 1)"
+        [[ "$orig" =~ ^[0-9]+$ ]] || orig="$current"
+    elif [[ -e "$TFO_SYSCTL" ]]; then
+        warn "$TFO_SYSCTL 已存在且不是本脚本创建的，未修改。" >&2
+        return 1
+    fi
+    new=$(( current | 3 ))
+    printf '%s\n# original=%s\nnet.ipv4.tcp_fastopen = %s\n' "$TFO_TAG" "$orig" "$new" > "$TFO_SYSCTL" || return 1
+    chmod 644 "$TFO_SYSCTL" || return 1
+    sysctl -q -w "net.ipv4.tcp_fastopen=$new" >/dev/null
+}
+# 删除本脚本的 sysctl 文件，并把内核参数恢复成开启前的值。
+disable_kernel_tfo() {
+    local orig
+    tfo_sysctl_is_ours || return 0
+    orig="$(sed -n 's/^# original=\([0-9]*\)$/\1/p' "$TFO_SYSCTL" | head -n 1)"
+    rm -f -- "$TFO_SYSCTL"
+    if [[ "$orig" =~ ^[0-9]+$ ]]; then
+        sysctl -q -w "net.ipv4.tcp_fastopen=$orig" >/dev/null 2>&1 || true
+    fi
+}
+
 format_duration() {
     local s="$1"
     if (( s >= 86400 )); then
@@ -315,6 +377,7 @@ purge_node_files() {
     systemctl disable --now sing-box >/dev/null 2>&1 || true
     apt-get purge -y sing-box >/dev/null 2>&1 || warn '软件包卸载失败，请运行 dpkg-query -W sing-box 检查。' >&2
     systemctl daemon-reload >/dev/null 2>&1 || true
+    disable_kernel_tfo
     rm -rf -- /etc/sing-box /var/lib/sing-box
     if getent passwd sing-box >/dev/null 2>&1; then userdel sing-box >/dev/null 2>&1 || true; fi
     if getent group sing-box >/dev/null 2>&1; then groupdel sing-box >/dev/null 2>&1 || true; fi
@@ -349,13 +412,15 @@ AnyTLS 节点管理脚本 v${SCRIPT_VERSION}（以 root 身份运行）
   password            生成新密码；需更新 Surge 节点行
   port [新端口]       修改节点端口；需先放行新端口并更新 Surge
   rename [新名称]     修改节点名称；需更新 Surge 节点行
+  addr [ip|domain]    节点行服务器地址改用 IP 或域名；需更新 Surge 节点行
+  tfo [on|off]        开关 TCP Fast Open；需更新 Surge 节点行
   start|stop|restart  启动、停止、重启服务
   log [-f|行数]       查看运行日志；-f 为实时查看
   version             查看 sing-box 已安装版本和官方最新稳定版
   update              升级 sing-box
   self-update         更新本管理脚本
   uninstall           卸载节点并清理残留
-  0–12                直接执行菜单中对应序号的操作
+  0–14                直接执行菜单中对应序号的操作
 EOF
 }
 
@@ -366,6 +431,8 @@ load_metadata() {
     DOMAIN="$MARKER_DOMAIN"
     PORT="$MARKER_PORT"
     NODE_NAME="$MARKER_NAME"
+    ADDR_MODE="$MARKER_MODE"
+    ADDR_IP="$MARKER_IP"
     if [[ -z "$DOMAIN" || -z "$PORT" ]]; then
         DOMAIN="$(jq -r '.certificate_providers[0].domain[0] // empty' "$CONFIG" 2>/dev/null || true)"
         PORT="$(jq -r '[.inbounds[] | select(.type == "anytls") | .listen_port][0] // empty' "$CONFIG" 2>/dev/null || true)"
@@ -377,10 +444,14 @@ load_metadata() {
 show_node() {
     need_root
     load_metadata
-    local password line
+    local password line tfo=false server="$DOMAIN"
     password="$(config_password)" || fail '无法从配置读取密码。'
-    printf -v line '%s = anytls, %s, %s, password=%s, skip-cert-verify=false, tfo=true, sni=%s' \
-        "$NODE_NAME" "$DOMAIN" "$PORT" "$password" "$DOMAIN"
+    # 只有服务端真正开启 TFO 时才写 tfo=true。
+    if tfo_active; then tfo=true; fi
+    # IP 模式下服务器地址用 IP，sni 始终是证书域名。
+    if [[ "$ADDR_MODE" == ip && -n "$ADDR_IP" ]]; then server="$ADDR_IP"; fi
+    printf -v line '%s = anytls, %s, %s, password=%s, skip-cert-verify=false, tfo=%s, sni=%s' \
+        "$NODE_NAME" "$server" "$PORT" "$password" "$tfo" "$DOMAIN"
     printf '%s\n' "$line" > "$SURGE_FILE"
     chmod 600 "$SURGE_FILE"
     printf '%s\n' "$line"
@@ -485,12 +556,34 @@ install_node() {
     fi
     valid_node_name "$NODE_NAME" || fail '节点名称不能为空、不能超过 64 个字符，也不能包含逗号、等号或换行。'
 
+    local addr_mode=domain addr_ip='' tfo=0
+    if (( interactive )); then
+        say '节点行的服务器地址：1) 域名（默认）  2) IP（sni 仍为域名）'
+        while true; do
+            read -r -p '请选择 [1/2]：' answer || fail '已取消输入。'
+            case "$answer" in
+                ''|1) addr_mode=domain; break ;;
+                2) addr_mode=ip; break ;;
+                *) warn '请输入 1 或 2。' >&2 ;;
+            esac
+        done
+        if confirm '是否开启 TCP Fast Open？收益很小，部分网络可能丢包 [y/N]：'; then
+            tfo=1
+        fi
+    fi
+
     if (( interactive )); then
         say
         step '—————————— 确认安装信息 ——————————'
         say "  域名：$DOMAIN"
         say "  端口：TCP $PORT"
         say "  名称：$NODE_NAME"
+        if [[ "$addr_mode" == ip ]]; then
+            say '  地址：IP（安装时自动填入本机公网 IPv4）'
+        else
+            say '  地址：域名'
+        fi
+        if (( tfo )); then say '  TFO： 开启'; else say '  TFO： 关闭'; fi
         warn "  请确认云安全组已放行 TCP 80 和 TCP ${PORT}"
         step '————————————————————————————————'
         if ! confirm '开始安装？[y/N]：'; then
@@ -525,6 +618,7 @@ install_node() {
     [[ "$dns_ips" == "$public_ip" ]] \
         || fail "域名 $DOMAIN 解析到 ${dns_ips//$'\n'/, }，但这台 VPS 的公网 IPv4 是 ${public_ip}。请修正 A 记录，生效后重试。"
     ok "域名已指向这台 VPS：$public_ip"
+    if [[ "$addr_mode" == ip ]]; then addr_ip="$public_ip"; fi
     local check_port
     for check_port in 80 "$PORT"; do
         port_free "$check_port" || fail "本机 TCP $check_port 已被占用。"
@@ -545,7 +639,9 @@ install_node() {
     step '[4/4] 配置节点并申请证书…'
     systemctl stop sing-box >/dev/null 2>&1 || true
     install -d -m 755 /etc/sing-box
-    write_marker "$DOMAIN" "$PORT" "$NODE_NAME"
+    ADDR_MODE="$addr_mode"
+    ADDR_IP="$addr_ip"
+    write_marker "$DOMAIN" "$PORT" "$NODE_NAME" "$addr_mode" "$addr_ip"
     getent passwd sing-box >/dev/null || fail '安装后未发现 sing-box 系统用户。'
     password="$(gen_password)"
     install -d -o sing-box -g sing-box -m 700 "$ACME_DIR"
@@ -580,6 +676,12 @@ install_node() {
 EOF
     chown root:sing-box "$CONFIG"
     chmod 640 "$CONFIG"
+    if (( tfo )); then
+        edit_config '(.inbounds[] | select(.type == "anytls") | .tcp_fast_open) = true' \
+            || fail '写入 TCP Fast Open 配置失败。'
+        enable_kernel_tfo || fail '开启内核 TCP Fast Open 失败。'
+        ok '已开启 TCP Fast Open。'
+    fi
     runuser -u sing-box -- /usr/bin/sing-box check -c "$CONFIG"
     systemctl enable --now sing-box
 
@@ -634,6 +736,23 @@ status_node() {
     local since since_epoch cert_end end_epoch days color installed latest
     say "节点名称：$NODE_NAME"
     say "服务器：  $DOMAIN:$PORT"
+    if [[ "$ADDR_MODE" == ip ]]; then
+        local now_ip
+        say "节点地址：IP ${ADDR_IP}（sni 为 ${DOMAIN}）"
+        now_ip="$(public_ipv4 || true)"
+        if [[ -n "$now_ip" && "$now_ip" != "$ADDR_IP" ]]; then
+            warn "VPS 公网 IP 已变为 ${now_ip}，Surge 里的节点会连不上；请运行 $(cmd_name) addr ip 更新。"
+        fi
+    else
+        say '节点地址：域名'
+    fi
+    if tfo_active; then
+        say "TCP Fast Open：${GREEN}已开启${RESET}"
+    elif config_tfo_enabled || tfo_sysctl_is_ours; then
+        warn "TCP Fast Open：设置不完整（sing-box 与内核参数不一致），运行 $(cmd_name) tfo on 修复，或 $(cmd_name) tfo off 关闭。"
+    else
+        say 'TCP Fast Open：未开启'
+    fi
     if systemctl is-active --quiet sing-box; then
         service_ok=1
         since="$(systemctl show sing-box -p ActiveEnterTimestamp --value 2>/dev/null || true)"
@@ -890,6 +1009,122 @@ rename_node() {
     show_node
 }
 
+addr_node() {
+    need_root
+    [[ $# -le 1 ]] || fail "用法：$(cmd_name) addr [ip|domain]"
+    load_metadata
+    local target="${1:-}" ip dns_ips
+    if [[ -z "$target" ]]; then
+        if [[ "$ADDR_MODE" == ip ]]; then
+            say "当前节点行服务器地址：IP ${ADDR_IP}（sni 为 ${DOMAIN}）"
+        else
+            say "当前节点行服务器地址：域名 ${DOMAIN}"
+        fi
+        [[ -t 0 ]] || return 0
+        if [[ "$ADDR_MODE" == ip ]]; then
+            confirm '是否切换为域名？[y/N]：' || { say '未修改。'; return 0; }
+            target=domain
+        else
+            confirm '是否切换为 IP？[y/N]：' || { say '未修改。'; return 0; }
+            target=ip
+        fi
+    fi
+    case "$target" in
+        domain)
+            if [[ "$ADDR_MODE" == domain ]]; then
+                ok '节点行已经使用域名，无需修改。'
+                return 0
+            fi
+            write_marker "$DOMAIN" "$PORT" "$NODE_NAME" domain '' || fail '写入安装记录失败，未修改。'
+            ok "节点行服务器地址已改为域名 ${DOMAIN}，服务无需重启。"
+            ;;
+        ip)
+            command -v curl >/dev/null 2>&1 || fail '缺少 curl，无法查询本机公网 IPv4。'
+            ip="$(public_ipv4)" || fail '无法查到此 VPS 的公网 IPv4。'
+            dns_ips="$(getent ahostsv4 "$DOMAIN" 2>/dev/null | awk '$2 == "STREAM" {print $1}' | sort -u || true)"
+            if [[ "$dns_ips" != "$ip" ]]; then
+                warn "注意：域名 $DOMAIN 当前解析到 ${dns_ips:-（无记录）}，与本机公网 IPv4 $ip 不一致；证书续期会失败，请修正 A 记录。"
+            fi
+            if [[ "$ADDR_MODE" == ip && "$ADDR_IP" == "$ip" ]]; then
+                ok "节点行已经使用 IP ${ip}，无需修改。"
+                return 0
+            fi
+            write_marker "$DOMAIN" "$PORT" "$NODE_NAME" ip "$ip" || fail '写入安装记录失败，未修改。'
+            ok "节点行服务器地址已改为 IP ${ip}，服务无需重启。"
+            warn "VPS 更换 IP 后，需重新运行 $(cmd_name) addr ip 并更新 Surge；域名解析不能删除，证书续期仍需要它。"
+            ;;
+        *) fail "用法：$(cmd_name) addr [ip|domain]" ;;
+    esac
+    say '将下面这一行替换到 Surge 配置文件的 [Proxy] 段：'
+    show_node
+}
+
+tfo_node() {
+    need_root
+    [[ $# -le 1 ]] || fail "用法：$(cmd_name) tfo [on|off]"
+    load_metadata
+    local action="${1:-}" backup changed=1
+    if [[ -z "$action" ]]; then
+        if tfo_active; then say 'TCP Fast Open：已开启'; else say 'TCP Fast Open：未开启'; fi
+        [[ -t 0 ]] || return 0
+        if tfo_active; then
+            confirm '是否关闭 TCP Fast Open？[y/N]：' || { say '未修改。'; return 0; }
+            action=off
+        else
+            warn 'TFO 只能省掉新建连接时的 1 次往返，收益很小；部分网络会丢弃握手时携带数据的包。'
+            confirm '是否开启 TCP Fast Open？[y/N]：' || { say '未修改。'; return 0; }
+            action=on
+        fi
+    fi
+    case "$action" in
+        on)
+            if tfo_active && tfo_sysctl_is_ours; then
+                ok 'TCP Fast Open 已开启，无需修改。'
+                return 0
+            fi
+            ;;
+        off)
+            if ! config_tfo_enabled && ! tfo_sysctl_is_ours; then
+                ok 'TCP Fast Open 已关闭，无需修改。'
+                return 0
+            fi
+            ;;
+        *) fail "用法：$(cmd_name) tfo [on|off]" ;;
+    esac
+
+    backup="$(mktemp /etc/sing-box/config.json.backup.XXXXXX)"
+    if ! cp -a -- "$CONFIG" "$backup"; then
+        rm -f -- "$backup"
+        fail '配置备份失败，未修改。'
+    fi
+    if [[ "$action" == on ]]; then
+        if ! edit_config '(.inbounds[] | select(.type == "anytls") | .tcp_fast_open) = true' \
+            || ! enable_kernel_tfo; then
+            changed=0
+        fi
+    else
+        edit_config '(.inbounds[] | select(.type == "anytls")) |= del(.tcp_fast_open)' || changed=0
+        disable_kernel_tfo
+    fi
+    if (( changed )) && runuser -u sing-box -- /usr/bin/sing-box check -c "$CONFIG" \
+        && systemctl restart sing-box && wait_tls 5; then
+        rm -f -- "$backup" || true
+    else
+        warn '修改或验证失败，正在恢复原设置…' >&2
+        mv -f -- "$backup" "$CONFIG" || fail "恢复配置失败，原备份保留在 ${backup}。"
+        if [[ "$action" == on ]]; then disable_kernel_tfo; else enable_kernel_tfo || true; fi
+        systemctl restart sing-box || true
+        fail "TCP Fast Open 设置失败，已恢复原设置；请运行 $(cmd_name) log 查看日志。"
+    fi
+    if [[ "$action" == on ]]; then
+        ok "已开启 TCP Fast Open（内核 net.ipv4.tcp_fastopen=$(kernel_tfo_value)）。"
+    else
+        ok "已关闭 TCP Fast Open（内核 net.ipv4.tcp_fastopen=$(kernel_tfo_value)）。"
+    fi
+    say '将下面这一行替换到 Surge 配置文件的 [Proxy] 段：'
+    show_node
+}
+
 start_node() {
     need_root
     load_metadata
@@ -997,6 +1232,7 @@ uninstall_node() {
     say '  · /etc/sing-box（配置、安装记录、备份）和 /var/lib/sing-box（证书、缓存）'
     say "  · ${SURGE_FILE}、${UNINSTALLER}、${MANAGER} 和更新时的临时文件"
     say "  · 快捷命令 ${SHORTCUT}"
+    say "  · TCP Fast Open 设置 ${TFO_SYSCTL}（如有），内核参数已恢复"
     warn '以下内容在 VPS 之外，如不再使用请自行删除：域名 DNS 记录、云安全组规则、Surge 中的节点配置。'
 }
 
@@ -1045,10 +1281,12 @@ show_menu() {
     say "  ${GREEN}7.${RESET} 修改密码"
     say "  ${GREEN}8.${RESET} 修改端口"
     say "  ${GREEN}9.${RESET} 修改节点名称"
+    say " ${GREEN}10.${RESET} 切换服务器地址（域名/IP）"
+    say " ${GREEN}11.${RESET} 开关 TCP Fast Open"
     say '——————————————————————————————'
-    say " ${GREEN}10.${RESET} 查看节点行"
-    say " ${GREEN}11.${RESET} 查看运行状态"
-    say " ${GREEN}12.${RESET} 查看运行日志"
+    say " ${GREEN}12.${RESET} 查看节点行"
+    say " ${GREEN}13.${RESET} 查看运行状态"
+    say " ${GREEN}14.${RESET} 查看运行日志"
     say '——————————————————————————————'
     say " ${GREEN}00.${RESET} 退出"
     say '=============================='
@@ -1068,9 +1306,11 @@ menu_action() {
         7) warn '修改后，Surge 中的旧密码会立即失效。'; change_password ;;
         8) warn '请先在服务商安全组放行准备使用的新端口。'; change_port ;;
         9) rename_node ;;
-        10) menu_show ;;
-        11) status_node ;;
-        12) log_node ;;
+        10) addr_node ;;
+        11) tfo_node ;;
+        12) menu_show ;;
+        13) status_node ;;
+        14) log_node ;;
         *) return 2 ;;
     esac
 }
@@ -1089,10 +1329,10 @@ interactive_menu() {
     fi
     while true; do
         show_menu
-        read -r -p ' 请输入数字 [0-12，00 退出]：' choice || { say; return 0; }
+        read -r -p ' 请输入数字 [0-14，00 退出]：' choice || { say; return 0; }
         case "$choice" in
             00|q|Q) return 0 ;;
-            [0-9]|1[0-2]) ;;
+            [0-9]|1[0-4]) ;;
             *) warn ' 请输入菜单中的数字。'; sleep 1; continue ;;
         esac
         before="$(cksum "$MANAGER" 2>/dev/null || true)"
@@ -1126,6 +1366,8 @@ main() {
         password) change_password ;;
         port) shift; change_port "$@" ;;
         rename) shift; rename_node "$@" ;;
+        addr) shift; addr_node "$@" ;;
+        tfo) shift; tfo_node "$@" ;;
         start) start_node ;;
         stop) stop_node ;;
         restart) restart_node ;;
@@ -1134,7 +1376,7 @@ main() {
         update) update_node ;;
         self-update|update-script) self_update ;;
         uninstall) uninstall_node ;;
-        [0-9]|1[0-2]) need_root; menu_action "$1" ;;
+        [0-9]|1[0-4]) need_root; menu_action "$1" ;;
         *) print_help; exit 2 ;;
     esac
 }
