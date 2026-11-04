@@ -18,6 +18,9 @@ ACME_DIR='/var/lib/sing-box/acme'
 SURGE_FILE='/root/anytls-surge.txt'
 MANAGER='/root/anytls-setup.sh'
 TEMP_DIR=''
+MARKER_DOMAIN=''
+MARKER_PORT=''
+MARKER_NAME=''
 INSTALL_STARTED=0
 INSTALL_COMMITTED=0
 MANAGER_COPIED=0
@@ -27,7 +30,69 @@ fail() { printf '错误：%s\n' "$*" >&2; exit 1; }
 need_root() { [[ $EUID -eq 0 ]] || fail '请以 root 身份运行：bash /root/anytls-setup.sh ...'; }
 need_command() { command -v "$1" >/dev/null 2>&1 || fail "缺少命令：$1"; }
 valid_domain() {
-    [[ "$1" =~ ^[a-z0-9.-]+$ && "$1" == *.* && "$1" != .* && "$1" != *. && "$1" != *..* ]]
+    (( ${#1} <= 253 )) || return 1
+    [[ "$1" == *.* && "$1" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?[.])+[a-z]([a-z0-9-]{0,61}[a-z0-9])?$ ]]
+}
+# 合法节点端口：1–65535 且不是 80（80 留给 ACME HTTP-01）。
+valid_port() {
+    [[ "$1" =~ ^[0-9]{1,5}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 && 10#$1 != 80 ))
+}
+port_free() {
+    local listeners
+    listeners="$(ss -H -ltn "sport = :$1")" || fail "无法检查本机 TCP ${1}。"
+    [[ -z "$listeners" ]]
+}
+gen_password() {
+    local pw
+    pw="$(od -An -N24 -tx1 /dev/urandom | tr -d '[:space:]')"
+    [[ ${#pw} -eq 48 ]] || fail '随机密码生成失败。'
+    printf '%s' "$pw"
+}
+# 读取安装记录：第 1 行域名，第 2 行端口，第 3 行节点名。
+read_marker() {
+    local lines=()
+    mapfile -t lines < "$MARKER" 2>/dev/null || true
+    MARKER_DOMAIN="${lines[0]:-}"
+    MARKER_PORT="${lines[1]:-}"
+    MARKER_NAME="${lines[2]:-}"
+}
+write_marker() {
+    printf '%s\n%s\n%s\n' "$1" "$2" "$3" > "$MARKER" && chmod 600 "$MARKER"
+}
+config_password() {
+    jq -er '[.inbounds[] | select(.type == "anytls") | .users[0].password][0] | select(type == "string")' "$CONFIG" 2>/dev/null
+}
+# 用 jq 修改配置并原子替换，保留 root:sing-box 640 权限；失败时原文件不变。
+edit_config() {
+    local tmp
+    tmp="$(mktemp /etc/sing-box/.config.json.XXXXXX)" || return 1
+    if jq "$@" "$CONFIG" > "$tmp" && chown root:sing-box "$tmp" && chmod 640 "$tmp" \
+        && mv -f -- "$tmp" "$CONFIG"; then
+        return 0
+    fi
+    rm -f -- "$tmp"
+    return 1
+}
+# 等待服务运行且本机 TLS 验证通过；参数为最多尝试次数（每次间隔 2 秒）。
+wait_tls() {
+    local attempt
+    for ((attempt = 1; attempt <= $1; attempt++)); do
+        if systemctl is-active --quiet sing-box && tls_ok; then return 0; fi
+        sleep 2
+    done
+    return 1
+}
+# 依次尝试多个查询源获取本机公网 IPv4。
+public_ipv4() {
+    local url ip
+    for url in https://api.ipify.org https://ipv4.icanhazip.com https://ifconfig.me/ip; do
+        ip="$(curl -4fsS --connect-timeout 5 --max-time 10 "$url" 2>/dev/null | tr -d '[:space:]')" || continue
+        if [[ "$ip" =~ ^[0-9]{1,3}([.][0-9]{1,3}){3}$ ]]; then
+            printf '%s' "$ip"
+            return 0
+        fi
+    done
+    return 1
 }
 
 ensure_dependencies() {
@@ -87,7 +152,12 @@ fetch_release_metadata() {
     RELEASE_URL=''
     RELEASE_SHA256=''
 
-    for ((page = 1; page <= 5; page++)); do
+    # release 对象通常已包含全部 assets：先直接查找，省去分页请求（未认证 API 限额 60 次/小时）。
+    asset_json="$(jq -c --arg name "$asset_name" \
+        '[(.assets // [])[] | select(.name == $name)] | if length == 1 then .[0] else null end' "$release_file")" \
+        || fail '无法读取安装包信息。'
+    page=1
+    while [[ "$asset_json" == null ]] && (( page <= 5 )); do
         assets_file="$TEMP_DIR/assets.json"
         curl -fLsS --retry 3 --connect-timeout 10 --max-time 30 \
             -H 'Accept: application/vnd.github+json' -o "$assets_file" \
@@ -98,21 +168,20 @@ fetch_release_metadata() {
         asset_json="$(jq -c --arg name "$asset_name" \
             '[.[] | select(.name == $name)] | if length == 1 then .[0] else null end' "$assets_file")" \
             || fail '无法读取安装包信息。'
-        if [[ "$asset_json" != null ]]; then
-            url="$(jq -er '.browser_download_url | select(type == "string")' <<< "$asset_json")" \
-                || fail '官方安装包缺少下载地址。'
-            digest="$(jq -er '.digest | select(type == "string")' <<< "$asset_json")" \
-                || fail '官方安装包缺少 SHA-256。'
-            [[ "$url" == "https://github.com/SagerNet/sing-box/releases/download/$tag/$asset_name" ]] \
-                || fail '官方安装包下载地址格式异常。'
-            [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || fail '官方安装包 SHA-256 格式异常。'
-            RELEASE_URL="$url"
-            RELEASE_SHA256="${digest#sha256:}"
-            return 0
-        fi
         (( asset_count == 100 )) || break
+        page=$((page + 1))
     done
-    fail "官方稳定版 $tag 没有找到 ${asset_name}。"
+    [[ "$asset_json" != null ]] || fail "官方稳定版 $tag 没有找到 ${asset_name}。"
+
+    url="$(jq -er '.browser_download_url | select(type == "string")' <<< "$asset_json")" \
+        || fail '官方安装包缺少下载地址。'
+    digest="$(jq -er '.digest | select(type == "string")' <<< "$asset_json")" \
+        || fail '官方安装包缺少 SHA-256。'
+    [[ "$url" == "https://github.com/SagerNet/sing-box/releases/download/$tag/$asset_name" ]] \
+        || fail '官方安装包下载地址格式异常。'
+    [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || fail '官方安装包 SHA-256 格式异常。'
+    RELEASE_URL="$url"
+    RELEASE_SHA256="${digest#sha256:}"
 }
 
 download_verified_package() {
@@ -177,14 +246,13 @@ interactive_menu() {
         print_help
         return
     fi
-    local choice saved_domain saved_port
+    local choice
     say
     say '========== AnyTLS 节点管理 =========='
     if [[ -f "$MARKER" && -f "$CONFIG" ]]; then
-        saved_domain="$(sed -n '1p' "$MARKER")"
-        saved_port="$(sed -n '2p' "$MARKER")"
+        read_marker
         say '检测到本脚本已配置的节点。'
-        say "当前节点：${saved_domain:-未知域名}:${saved_port:-未知端口}"
+        say "当前节点：${MARKER_DOMAIN:-未知域名}:${MARKER_PORT:-未知端口}"
         say '  1) 查看节点状态'
         say '  2) 查看 Surge 节点行（含密码）'
         say '  3) 修改密码'
@@ -241,33 +309,35 @@ interactive_menu() {
 
 load_metadata() {
     [[ -f "$MARKER" && -f "$CONFIG" ]] || fail '未发现本脚本安装的节点。'
-    DOMAIN="$(sed -n '1p' "$MARKER")"
-    PORT="$(sed -n '2p' "$MARKER")"
-    NODE_NAME="$(sed -n '3p' "$MARKER")"
+    command -v jq >/dev/null 2>&1 || fail '缺少 jq，请先运行：apt-get update && apt-get install -y jq'
+    read_marker
+    DOMAIN="$MARKER_DOMAIN"
+    PORT="$MARKER_PORT"
+    NODE_NAME="$MARKER_NAME"
     if [[ -z "$DOMAIN" || -z "$PORT" ]]; then
-        DOMAIN="$(sed -n 's/.*"domain": \["\([^"]*\)"\].*/\1/p' "$CONFIG" | head -n 1)"
-        PORT="$(sed -n 's/.*"listen_port": \([0-9]*\).*/\1/p' "$CONFIG" | head -n 1)"
+        DOMAIN="$(jq -r '.certificate_providers[0].domain[0] // empty' "$CONFIG" 2>/dev/null || true)"
+        PORT="$(jq -r '[.inbounds[] | select(.type == "anytls") | .listen_port][0] // empty' "$CONFIG" 2>/dev/null || true)"
     fi
     [[ -n "$DOMAIN" && "$PORT" =~ ^[0-9]+$ ]] || fail '安装记录不完整。'
     [[ -n "$NODE_NAME" ]] || NODE_NAME="AnyTLS-$(hostname -s)"
 }
 
+# 本机 TLS 握手并校验证书链与域名；握手输出保存在 TLS_OUTPUT，供读取证书到期时间。
+TLS_OUTPUT=''
 tls_ok() {
-    local output
-    output="$(timeout 6 openssl s_client \
+    TLS_OUTPUT="$(timeout 6 openssl s_client \
         -connect "127.0.0.1:${PORT}" \
         -servername "$DOMAIN" \
         -verify_hostname "$DOMAIN" \
-        -verify_return_error -brief </dev/null 2>&1 || true)"
-    [[ "$output" == *'Verification: OK'* ]]
+        -verify_return_error </dev/null 2>&1 || true)"
+    [[ "$TLS_OUTPUT" == *'Verify return code: 0 (ok)'* ]]
 }
 
 show_node() {
     need_root
     load_metadata
     local password line
-    password="$(sed -n 's/.*"password": "\([^"]*\)".*/\1/p' "$CONFIG" | head -n 1)"
-    [[ -n "$password" ]] || fail '无法从配置读取密码。'
+    password="$(config_password)" || fail '无法从配置读取密码。'
     printf -v line '%s = anytls, %s, %s, password=%s, skip-cert-verify=false, tfo=true, sni=%s' \
         "$NODE_NAME" "$DOMAIN" "$PORT" "$password" "$DOMAIN"
     printf '%s\n' "$line" > "$SURGE_FILE"
@@ -276,11 +346,9 @@ show_node() {
 }
 
 check_install_eligibility() {
-    local saved_domain saved_port
     if [[ -f "$MARKER" && -f "$CONFIG" ]]; then
-        saved_domain="$(sed -n '1p' "$MARKER")"
-        saved_port="$(sed -n '2p' "$MARKER")"
-        fail "检测到本脚本已配置节点 ${saved_domain:-未知域名}:${saved_port:-未知端口}。请运行 bash /root/anytls-setup.sh 打开管理菜单。"
+        read_marker
+        fail "检测到本脚本已配置节点 ${MARKER_DOMAIN:-未知域名}:${MARKER_PORT:-未知端口}。请运行 bash /root/anytls-setup.sh 打开管理菜单。"
     fi
     [[ ! -e "$MARKER" && ! -L "$MARKER" ]] || fail '检测到已有节点安装记录，但配置不完整；已停止以保护现有文件。'
     if command -v dpkg-query >/dev/null 2>&1 \
@@ -325,17 +393,18 @@ install_node() {
         while true; do
             read -r -p '请输入 AnyTLS 节点 TCP 端口（1–65535，不能是 80）：' raw_port \
                 || fail '已取消输入。'
-            if [[ "$raw_port" =~ ^[0-9]{1,5}$ ]]; then
-                PORT="$((10#$raw_port))"
-                if (( PORT >= 1 && PORT <= 65535 && PORT != 80 )); then break; fi
+            if valid_port "$raw_port"; then
+                if ! command -v ss >/dev/null 2>&1 || port_free "$((10#$raw_port))"; then break; fi
+                say "本机 TCP $((10#$raw_port)) 已被占用，请换一个端口。" >&2
+                continue
             fi
             say '端口无效，请输入 1–65535 的数字；TCP 80 留给证书验证。' >&2
         done
     fi
     [[ "$raw_port" =~ ^[0-9]{1,5}$ ]] || fail '端口必须是 1–65535 的数字。'
+    (( 10#$raw_port != 80 )) || fail 'TCP 80 需要留给证书申请，请另选节点端口。'
+    valid_port "$raw_port" || fail '端口必须是 1–65535 的数字。'
     PORT="$((10#$raw_port))"
-    (( PORT >= 1 && PORT <= 65535 )) || fail '端口必须是 1–65535 的数字。'
-    (( PORT != 80 )) || fail 'TCP 80 需要留给证书申请，请另选节点端口。'
     [[ "$NODE_NAME" != *','* && "$NODE_NAME" != *'='* && "$NODE_NAME" != *$'\n'* ]] \
         || fail '节点名称不能包含逗号、等号或换行。'
     say
@@ -363,16 +432,14 @@ install_node() {
     dns_ips="$(getent ahostsv4 "$DOMAIN" | awk '$2 == "STREAM" {print $1}' | sort -u)" \
         || fail "无法解析域名 ${DOMAIN}。"
     [[ -n "$dns_ips" ]] || fail "域名 $DOMAIN 没有 IPv4 A 记录。"
-    public_ip="$(curl -4fsS --connect-timeout 5 --max-time 12 https://api.ipify.org)" \
-        || fail '无法查到此 VPS 的公网 IPv4。'
+    public_ip="$(public_ipv4)" || fail '无法查到此 VPS 的公网 IPv4。'
     [[ "$dns_ips" == "$public_ip" ]] \
         || fail "域名 $DOMAIN 解析到 ${dns_ips//$'\n'/, }，但这台 VPS 的公网 IPv4 是 ${public_ip}。请修正 A 记录，生效后重试。"
     say "域名已指向这台 VPS：$public_ip"
 
-    local listeners
+    local check_port
     for check_port in 80 "$PORT"; do
-        listeners="$(ss -H -ltn "sport = :$check_port")" || fail "无法检查本机 TCP ${check_port}。"
-        [[ -z "$listeners" ]] || fail "本机 TCP $check_port 已被占用。"
+        port_free "$check_port" || fail "本机 TCP $check_port 已被占用。"
     done
 
     local password
@@ -389,12 +456,10 @@ install_node() {
     say '[4/4] 配置节点并申请证书…'
     systemctl stop sing-box >/dev/null 2>&1 || true
     install -d -m 755 /etc/sing-box
-    printf '%s\n%s\n%s\n' "$DOMAIN" "$PORT" "$NODE_NAME" > "$MARKER"
-    chmod 600 "$MARKER"
+    write_marker "$DOMAIN" "$PORT" "$NODE_NAME"
     getent passwd sing-box >/dev/null || fail '安装后未发现 sing-box 系统用户。'
 
-    password="$(od -An -N24 -tx1 /dev/urandom | tr -d '[:space:]')"
-    [[ ${#password} -eq 48 ]] || fail '随机密码生成失败。'
+    password="$(gen_password)"
     install -d -o sing-box -g sing-box -m 700 "$ACME_DIR"
     cat > "$CONFIG" <<EOF
 {
@@ -484,8 +549,7 @@ status_node() {
     if tls_ok; then
         say 'TLS 证书：验证通过'
         tls_verified=1
-        cert_expiry="$(timeout 6 openssl s_client -connect "127.0.0.1:${PORT}" -servername "$DOMAIN" -showcerts \
-            </dev/null 2>/dev/null | openssl x509 -noout -enddate 2>/dev/null || true)"
+        cert_expiry="$(openssl x509 -noout -enddate <<< "$TLS_OUTPUT" 2>/dev/null || true)"
         if [[ -n "$cert_expiry" ]]; then say "证书到期：${cert_expiry#notAfter=}"; fi
     else
         say 'TLS 证书：验证未通过'
@@ -525,7 +589,7 @@ version_node() {
 update_node() {
     need_root
     load_metadata
-    local installed arch new_version old_version attempt verified=0 restored=1 recovery_dir
+    local installed arch new_version old_version verified=0 restored=1 recovery_dir
     installed="$(dpkg-query -W -f='${Version}' sing-box 2>/dev/null)" \
         || fail '无法读取已安装的 sing-box 版本。'
     [[ "$installed" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
@@ -562,14 +626,8 @@ update_node() {
 
     if dpkg -i "$TEMP_DIR/new.deb" && systemctl daemon-reload \
         && runuser -u sing-box -- /usr/bin/sing-box check -c "$CONFIG" \
-        && systemctl restart sing-box; then
-        for ((attempt = 1; attempt <= 5; attempt++)); do
-            if systemctl is-active --quiet sing-box && tls_ok; then
-                verified=1
-                break
-            fi
-            sleep 2
-        done
+        && systemctl restart sing-box && wait_tls 5; then
+        verified=1
     fi
     if (( verified )); then
         say "升级完成：sing-box ${new_version}。节点域名、端口和密码未变。"
@@ -593,18 +651,16 @@ change_password() {
     need_root
     load_metadata
     local old_password new_password backup
-    old_password="$(sed -n 's/.*"password": "\([^"]*\)".*/\1/p' "$CONFIG" | head -n 1)"
+    old_password="$(config_password)" || fail '无法从配置读取密码。'
     [[ "$old_password" =~ ^[0-9a-f]{48}$ ]] || fail '配置中的节点密码格式异常，已停止。'
-    new_password="$(od -An -N24 -tx1 /dev/urandom | tr -d '[:space:]')"
-    [[ ${#new_password} -eq 48 ]] || fail '随机密码生成失败。'
+    new_password="$(gen_password)"
     backup="$(mktemp /etc/sing-box/config.json.backup.XXXXXX)"
     if ! cp -a -- "$CONFIG" "$backup"; then
         rm -f -- "$backup"
         fail '配置备份失败，密码未修改。'
     fi
-    if ! sed -i "s/\"password\": \"$old_password\"/\"password\": \"$new_password\"/" "$CONFIG" \
-        || ! chown root:sing-box "$CONFIG" \
-        || ! chmod 640 "$CONFIG" \
+    if ! edit_config --arg pw "$new_password" \
+            '(.inbounds[] | select(.type == "anytls") | .users[0].password) = $pw' \
         || ! runuser -u sing-box -- /usr/bin/sing-box check -c "$CONFIG" \
         || ! systemctl restart sing-box \
         || ! systemctl is-active --quiet sing-box; then
@@ -622,27 +678,27 @@ change_port() {
     need_root
     [[ $# -le 1 ]] || fail '用法：bash anytls-setup.sh port [新端口]'
     load_metadata
-    local old_port="$PORT" raw_port="${1:-}" new_port match_count backup_dir attempt verified=0 listeners
+    local old_port="$PORT" raw_port="${1:-}" new_port match_count backup_dir verified=0
     if [[ -z "$raw_port" ]]; then
         [[ -t 0 ]] || fail '非交互运行时，请在命令中指定新端口。'
         while true; do
             read -r -p "当前端口 ${old_port}；请输入新的 AnyTLS TCP 端口：" raw_port \
                 || fail '已取消输入。'
-            if [[ "$raw_port" =~ ^[0-9]{1,5}$ ]]; then
-                new_port="$((10#$raw_port))"
-                if (( new_port >= 1 && new_port <= 65535 && new_port != 80 && new_port != old_port )); then break; fi
+            if valid_port "$raw_port" && (( 10#$raw_port != old_port )); then
+                if port_free "$((10#$raw_port))"; then break; fi
+                say "本机 TCP $((10#$raw_port)) 已被占用，请换一个端口。" >&2
+                continue
             fi
             say "端口无效。请输入 1–65535 的数字，不能是 TCP 80 或当前端口 ${old_port}。" >&2
         done
     fi
     [[ "$raw_port" =~ ^[0-9]{1,5}$ ]] || fail '端口必须是 1–65535 的数字。'
+    (( 10#$raw_port != 80 )) || fail 'TCP 80 用于证书验证，请另选节点端口。'
+    valid_port "$raw_port" || fail '端口必须是 1–65535 的数字。'
     new_port="$((10#$raw_port))"
-    (( new_port >= 1 && new_port <= 65535 )) || fail '端口必须是 1–65535 的数字。'
-    (( new_port != 80 )) || fail 'TCP 80 用于证书验证，请另选节点端口。'
     (( new_port != old_port )) || fail "新端口与当前端口相同：${old_port}。"
-    listeners="$(ss -H -ltn "sport = :$new_port")" || fail "无法检查本机 TCP ${new_port}。"
-    [[ -z "$listeners" ]] || fail "本机 TCP $new_port 已被占用。"
-    match_count="$(grep -Fc -- "\"listen_port\": $old_port," "$CONFIG" || true)"
+    port_free "$new_port" || fail "本机 TCP $new_port 已被占用。"
+    match_count="$(jq --argjson p "$old_port" '[.inbounds[] | select(.type == "anytls" and .listen_port == $p)] | length' "$CONFIG" 2>/dev/null || true)"
     [[ "$match_count" == 1 ]] || fail '配置中的当前端口不唯一或不存在，已停止以避免改错。'
     say "正在切换到 TCP ${new_port}；请确认已在服务商安全组放行该端口。"
 
@@ -651,26 +707,19 @@ change_port() {
         rm -rf -- "$backup_dir"
         fail '配置备份失败，端口未修改。'
     fi
-    if ! sed -i "s/\"listen_port\": $old_port,/\"listen_port\": $new_port,/" "$CONFIG" \
-        || ! chown root:sing-box "$CONFIG" \
-        || ! chmod 640 "$CONFIG" \
-        || ! printf '%s\n%s\n%s\n' "$DOMAIN" "$new_port" "$NODE_NAME" > "$MARKER" \
-        || ! chmod 600 "$MARKER"; then
+    if ! edit_config --argjson old "$old_port" --argjson new "$new_port" \
+            '(.inbounds[] | select(.type == "anytls" and .listen_port == $old) | .listen_port) = $new' \
+        || ! write_marker "$DOMAIN" "$new_port" "$NODE_NAME"; then
         cp -a -- "$backup_dir/config.json" "$CONFIG" || fail "恢复配置失败，原备份保留在 ${backup_dir}。"
         cp -a -- "$backup_dir/.anytls-setup-owned" "$MARKER" || fail "恢复安装记录失败，原备份保留在 ${backup_dir}。"
         rm -rf -- "$backup_dir"
         fail '修改端口文件失败，已恢复旧配置。'
     fi
 
-    if runuser -u sing-box -- /usr/bin/sing-box check -c "$CONFIG" && systemctl restart sing-box; then
-        PORT="$new_port"
-        for ((attempt = 1; attempt <= 5; attempt++)); do
-            if systemctl is-active --quiet sing-box && tls_ok; then
-                verified=1
-                break
-            fi
-            sleep 2
-        done
+    PORT="$new_port"
+    if runuser -u sing-box -- /usr/bin/sing-box check -c "$CONFIG" && systemctl restart sing-box \
+        && wait_tls 5; then
+        verified=1
     fi
     if (( verified == 0 )); then
         cp -a -- "$backup_dir/config.json" "$CONFIG" || fail "恢复配置失败，原备份保留在 ${backup_dir}。"
@@ -705,7 +754,7 @@ uninstall_node() {
     confirm_uninstall || return 0
     systemctl disable --now sing-box >/dev/null 2>&1 || true
     apt-get purge -y sing-box
-    rm -f -- "$CONFIG" "$MARKER" "$SURGE_FILE" /etc/sing-box/config.json.backup.*
+    rm -f -- "$CONFIG" "$MARKER" "$SURGE_FILE" /etc/sing-box/config.json.backup.* /etc/sing-box/.config.json.*
     rm -rf -- /etc/sing-box/.port-backup.*
     rm -rf -- "$ACME_DIR"
     rmdir -- /etc/sing-box /var/lib/sing-box 2>/dev/null || true
