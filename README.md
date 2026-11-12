@@ -2,6 +2,8 @@
 
 在 Debian 或 Ubuntu VPS 上一键安装 AnyTLS 节点，安装完成后输出可直接放入 Surge `[Proxy]` 段的节点行。脚本提供中文管理菜单，可以启动、停止、重启服务，修改密码、端口和节点名称，升级 sing-box，更新脚本本身，以及卸载并清理残留。
 
+需要搭建 Xray `VLESS + REALITY + Vision` 时，请使用仓库内独立的 [vless-reality-vision](vless-reality-vision/) 安装器。它不会改动本项目的 AnyTLS 脚本，且不需要自有域名或开放 TCP 80。
+
 适用环境：使用 systemd 的 Debian/Ubuntu、`amd64` 或 `arm64` 架构，并拥有公网 IPv4。以下命令均在 VPS 上以 root 身份运行。
 
 ## 安装前准备
