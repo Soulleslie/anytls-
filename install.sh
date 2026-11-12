@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION='2.1.1'
+SCRIPT_VERSION='2.1.2'
 SCRIPT_URL='https://raw.githubusercontent.com/Soulleslie/anytls-/main/install.sh'
 DOMAIN=''
 PORT=''
@@ -412,6 +412,7 @@ AnyTLS 节点管理脚本 v${SCRIPT_VERSION}（以 root 身份运行）
   show                显示 Surge 节点行（含密码）
   password            生成新密码；需更新 Surge 节点行
   port [新端口]       修改节点端口；需先放行新端口并更新 Surge
+  domain [新域名]     更换证书域名；检查 DNS 并签发新证书后更新 Surge
   rename [新名称]     修改节点名称；需更新 Surge 节点行
   addr [ip|domain]    节点行服务器地址改用 IP 或域名；需更新 Surge 节点行
   tfo [on|off]        开关 TCP Fast Open；需更新 Surge 节点行
@@ -421,7 +422,7 @@ AnyTLS 节点管理脚本 v${SCRIPT_VERSION}（以 root 身份运行）
   update              升级 sing-box
   self-update         更新本管理脚本
   uninstall           卸载节点并清理残留
-  0–14                直接执行菜单中对应序号的操作
+  0–15                直接执行菜单中对应序号的操作
 EOF
 }
 
@@ -989,6 +990,69 @@ change_port() {
     warn '请勿把含密码的节点行发到聊天中。'
 }
 
+change_domain() {
+    need_root
+    [[ $# -le 1 ]] || fail "用法：$(cmd_name) domain [新域名]"
+    load_metadata
+    local old_domain="$DOMAIN" new_domain="${1:-}" dns_ips public_ip backup_dir new_addr_ip
+    if [[ -z "$new_domain" ]]; then
+        [[ -t 0 ]] || fail '非交互运行时，请在命令中指定新域名。'
+        read -r -p "当前域名 ${old_domain}；请输入已指向这台 VPS 的新域名：" new_domain || fail '已取消输入。'
+    fi
+    new_domain="${new_domain,,}"
+    valid_domain "$new_domain" || fail '域名格式不对。只输入域名，例如 sg.example.com，不要带 https:// 或路径。'
+    [[ "$new_domain" != "$old_domain" ]] || fail '新域名与当前域名相同。'
+    # 只修改本脚本创建的单域名 ACME 提供者，避免误改其他证书配置。
+    jq -e --arg old "$old_domain" '
+        ([.certificate_providers[]? | select(.tag == "anytls-cert")] | length) == 1 and
+        ([.certificate_providers[]? | select(.tag == "anytls-cert" and .type == "acme" and .domain == [$old])] | length) == 1 and
+        ([.inbounds[]? | select(.type == "anytls" and .tls.certificate_provider == "anytls-cert")] | length) == 1
+    ' "$CONFIG" >/dev/null || fail '当前 ACME 配置与安装记录不一致，已停止以避免改错。'
+    systemctl is-active --quiet sing-box || fail 'sing-box 服务未运行；请先恢复服务，再更换域名。'
+    need_command curl
+    dns_ips="$(getent ahostsv4 "$new_domain" | awk '$2 == "STREAM" {print $1}' | sort -u)" \
+        || fail "无法解析域名 ${new_domain}。"
+    [[ -n "$dns_ips" ]] || fail "域名 $new_domain 没有 IPv4 A 记录。"
+    public_ip="$(public_ipv4)" || fail '无法查到此 VPS 的公网 IPv4。'
+    [[ "$dns_ips" == "$public_ip" ]] \
+        || fail "域名 $new_domain 解析到 ${dns_ips//$'\n'/, }，但这台 VPS 的公网 IPv4 是 ${public_ip}。请修正 A 记录，生效后重试。"
+    new_addr_ip="$ADDR_IP"
+    if [[ "$ADDR_MODE" == ip ]]; then new_addr_ip="$public_ip"; fi
+    say "新域名 ${new_domain} 已指向这台 VPS；请确认 TCP 80 可从公网访问。"
+
+    backup_dir="$(mktemp -d /etc/sing-box/.domain-backup.XXXXXX)" || fail '无法创建配置备份。'
+    if ! cp -a -- "$CONFIG" "$MARKER" "$backup_dir/"; then
+        rm -rf -- "$backup_dir"
+        fail '配置备份失败，域名未修改。'
+    fi
+    if ! edit_config --arg old "$old_domain" --arg new "$new_domain" \
+            '(.certificate_providers[] | select(.type == "acme" and .tag == "anytls-cert" and .domain == [$old]) | .domain) = [$new]' \
+        || ! write_marker "$new_domain" "$PORT" "$NODE_NAME" "$ADDR_MODE" "$new_addr_ip"; then
+        cp -a -- "$backup_dir/config.json" "$CONFIG" || fail "恢复配置失败，原备份保留在 ${backup_dir}。"
+        cp -a -- "$backup_dir/.anytls-setup-owned" "$MARKER" || fail "恢复安装记录失败，原备份保留在 ${backup_dir}。"
+        rm -rf -- "$backup_dir"
+        fail '修改域名文件失败，已恢复旧配置。'
+    fi
+
+    DOMAIN="$new_domain"
+    say '正在申请新域名证书并验证 TLS（可能需要数分钟）…'
+    if ! runuser -u sing-box -- /usr/bin/sing-box check -c "$CONFIG" \
+        || ! systemctl restart sing-box || ! wait_tls 60; then
+        cp -a -- "$backup_dir/config.json" "$CONFIG" || fail "恢复配置失败，原备份保留在 ${backup_dir}。"
+        cp -a -- "$backup_dir/.anytls-setup-owned" "$MARKER" || fail "恢复安装记录失败，原备份保留在 ${backup_dir}。"
+        DOMAIN="$old_domain"
+        systemctl restart sing-box || warn '旧配置已恢复，但服务重启失败；请检查 systemctl status sing-box。' >&2
+        rm -rf -- "$backup_dir" || warn "旧配置备份清理失败，请检查 ${backup_dir}。" >&2
+        fail "新域名 ${new_domain} 的证书签发或 TLS 验证失败，已恢复旧域名 ${old_domain}；请检查 DNS、TCP 80 和 $(cmd_name) log。"
+    fi
+    rm -rf -- "$backup_dir" || warn "旧配置备份清理失败，请检查 ${backup_dir}。" >&2
+    ok "证书已为 ${new_domain} 验证通过；ACME 自动续期域名已从 ${old_domain} 改为 ${new_domain}。"
+    say '请将下面的新节点行替换到 Surge 配置文件的 [Proxy] 段：'
+    show_node
+    warn "保持 ${new_domain} 的 A 记录指向本机，并持续开放 TCP 80，以便自动续期。旧域名确认不用后可自行清理 DNS。"
+    warn '请勿把含密码的节点行发到聊天中。'
+}
+
 rename_node() {
     need_root
     [[ $# -le 1 ]] || fail "用法：$(cmd_name) rename [新名称]"
@@ -1306,6 +1370,7 @@ show_menu() {
     say "  ${GREEN}9.${RESET} 修改节点名称"
     say " ${GREEN}10.${RESET} 切换服务器地址（域名/IP）"
     say " ${GREEN}11.${RESET} 开关 TCP Fast Open"
+    say " ${GREEN}15.${RESET} 更换证书域名"
     say '——————————————————————————————'
     say " ${GREEN}12.${RESET} 查看节点行"
     say " ${GREEN}13.${RESET} 查看运行状态"
@@ -1331,6 +1396,7 @@ menu_action() {
         9) rename_node ;;
         10) addr_node ;;
         11) tfo_node ;;
+        15) change_domain ;;
         12) menu_show ;;
         13) status_node ;;
         14) log_node ;;
@@ -1353,10 +1419,10 @@ interactive_menu() {
     fi
     while true; do
         show_menu
-        read -r -p ' 请输入数字 [0-14，00 退出]：' choice || { say; return 0; }
+        read -r -p ' 请输入数字 [0-15，00 退出]：' choice || { say; return 0; }
         case "$choice" in
             00|q|Q) return 0 ;;
-            [0-9]|1[0-4]) ;;
+            [0-9]|1[0-5]) ;;
             *) warn ' 请输入菜单中的数字。'; sleep 1; continue ;;
         esac
         before="$(cksum "$MANAGER" 2>/dev/null || true)"
@@ -1389,6 +1455,7 @@ main() {
         show) show_node ;;
         password) change_password ;;
         port) shift; change_port "$@" ;;
+        domain) shift; change_domain "$@" ;;
         rename) shift; rename_node "$@" ;;
         addr) shift; addr_node "$@" ;;
         tfo) shift; tfo_node "$@" ;;
@@ -1400,7 +1467,7 @@ main() {
         update) update_node ;;
         self-update|update-script) self_update ;;
         uninstall) uninstall_node ;;
-        [0-9]|1[0-4]) need_root; menu_action "$1" ;;
+        [0-9]|1[0-5]) need_root; menu_action "$1" ;;
         *) print_help; exit 2 ;;
     esac
 }

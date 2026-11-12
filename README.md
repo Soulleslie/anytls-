@@ -1,6 +1,6 @@
 # AnyTLS 节点管理脚本
 
-在 Debian 或 Ubuntu VPS 上一键安装 AnyTLS 节点，安装完成后输出可直接放入 Surge `[Proxy]` 段的节点行。脚本提供中文管理菜单，可以启动、停止、重启服务，修改密码、端口和节点名称，升级 sing-box，更新脚本本身，以及卸载并清理残留。
+在 Debian 或 Ubuntu VPS 上一键安装 AnyTLS 节点，安装完成后输出可直接放入 Surge `[Proxy]` 段的节点行。脚本提供中文管理菜单，可以启动、停止、重启服务，修改密码、端口、域名和节点名称，升级 sing-box，更新脚本本身，以及卸载并清理残留。
 
 适用环境：使用 systemd 的 Debian/Ubuntu、`amd64` 或 `arm64` 架构，并拥有公网 IPv4。以下命令均在 VPS 上以 root 身份运行。
 
@@ -57,7 +57,7 @@ AnyTLS-SG = anytls, sg.example.com, 12003, password=你的实际密码, skip-cer
 
 ```
 ==============================
- AnyTLS 节点管理脚本 [v2.1.1]
+ AnyTLS 节点管理脚本 [v2.1.2]
 ==============================
   0. 更新脚本
 ——————————————————————————————
@@ -74,6 +74,7 @@ AnyTLS-SG = anytls, sg.example.com, 12003, password=你的实际密码, skip-cer
   9. 修改节点名称
  10. 切换服务器地址（域名/IP）
  11. 开关 TCP Fast Open
+ 15. 更换证书域名
 ——————————————————————————————
  12. 查看节点行
  13. 查看运行状态
@@ -96,6 +97,7 @@ AnyTLS-SG = anytls, sg.example.com, 12003, password=你的实际密码, skip-cer
 | `anytls show` | 输出 Surge 节点行，**包含密码** |
 | `anytls password` | 生成新密码；随后替换 Surge 中的旧节点行 |
 | `anytls port [新端口]` | 修改节点端口；先放行新端口，完成后更新 Surge |
+| `anytls domain [新域名]` | 更换证书域名；验证新域名的 A 记录、签发证书并验证 TLS，成功后更新 Surge |
 | `anytls rename [新名称]` | 修改节点名称；无需重启服务，完成后更新 Surge |
 | `anytls addr [ip\|domain]` | 节点行服务器地址改用 IP 或域名；无需重启服务，完成后更新 Surge |
 | `anytls tfo [on\|off]` | 开关 TCP Fast Open；完成后更新 Surge |
@@ -125,11 +127,18 @@ wget -O /root/anytls-setup.sh https://raw.githubusercontent.com/Soulleslie/anytl
 ## 服务器地址：域名或 IP
 
 节点行开头的服务器地址可以用域名，也可以用 IP；`sni` 始终是域名，所以加密和证书校验都不受影响。
+`anytls addr domain` 仅切换节点行的地址模式；要更换证书域名，请使用 `anytls domain 新域名`（或菜单 15）。
 
 - **域名（默认）**：VPS 换 IP 后只需修改 DNS 解析，Surge 不用改。
 - **IP**：连接时少一次 DNS 查询，也不受 DNS 污染影响；但 VPS 换 IP 后要运行 `anytls addr ip` 并更新 Surge。`anytls status` 会在本机公网 IP 变化时提醒。
 
 无论用哪种，域名的 A 记录都不能删，证书续期需要它。
+
+## 更换证书域名
+
+先将新域名的 A 记录指向当前 VPS 的公网 IPv4，确保 TCP 80 可从公网访问，并保持 sing-box 服务运行。运行 `anytls domain sg-new.example.com`，或在管理菜单中选择 15 并输入新域名。脚本会核对 DNS，更新 sing-box ACME 证书域名和安装记录，重启服务，等待新证书并以新域名验证 TLS；若签发或验证失败，会恢复旧配置和旧域名。成功后将输出的新节点行替换到 Surge 的 `[Proxy]` 段。使用 IP 地址模式时节点行会更新为当前 VPS 的公网 IP，`sni` 会改为新域名。
+
+新域名的 A 记录需持续指向 VPS，TCP 80 需持续开放，sing-box 才能为新域名自动续期。确认新节点可用后，旧域名的 DNS 可自行清理。
 
 ## TCP Fast Open
 
